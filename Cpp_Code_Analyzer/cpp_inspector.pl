@@ -27,6 +27,8 @@ use File::Spec;
 
 use Getopt::Long qw(GetOptions);
 
+use JSON::PP qw(encode_json);
+
 use constant {
     SOURCE_EXT_RE  => qr/\.(?:c|cpp|cxx|cc|h|hpp|hxx|hh)$/i,
     SKIP_DIR_RE    => qr/^(?:\.git|\.svn|\.hg|build|cmake-build.*|out)$/i,
@@ -81,8 +83,9 @@ sub main {
     my $report_path =
       File::Spec->catfile( $output_dir,
         report_filename( $opts, $kind_filter ) );
-    my $csv_path = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
-    my $svg_path = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
+    my $csv_path  = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
+    my $json_path = File::Spec->catfile( $output_dir, 'cpp_ai_report.json' );
+    my $svg_path  = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
 
     say "[3/8] Running ctags...";
     run_ctags( $cscope_files_path, $tags_path );
@@ -99,7 +102,7 @@ sub main {
     say "[7/8] Mapping caller/callee relationships via cscope...";
     my %callers_of = build_caller_map( \%definitions, $cscope_out_path );
 
-    say "[8/8] Writing text, CSV and SVG reports...";
+    say "[8/8] Writing text, CSV, JSON and SVG reports...";
     write_text_report(
         $report_path,
         \%definitions,
@@ -113,9 +116,10 @@ sub main {
         }
     );
     write_csv_report( $csv_path, \%callers_of );
+    write_json_report( $json_path, \%definitions, \%callers_of, $project_dir );
     write_svg_call_graph( $svg_path, \%callers_of );
 
-    print_summary( $db_path, $report_path, $csv_path, $svg_path );
+    print_summary( $db_path, $report_path, $csv_path, $json_path, $svg_path );
     return;
 }
 
@@ -458,6 +462,185 @@ sub find_callers {
 # Report generation
 # ----------------------------------------------------------------------
 
+# JSON export optimized for machine/AI consumption.
+#
+# Top-level structure:
+# {
+#   schema_version: "1.0",
+#   project: "...",
+#   summary: {...},
+#   files: [
+#     {
+#       path: "...",
+#       symbols: [
+#         {
+#           name: "...",
+#           kind: "f",
+#           kind_name: "Function",
+#           line: 123,
+#           signature: "...",
+#           return_type: "...",
+#           callers: [...]
+#         }
+#       ]
+#     }
+#   ],
+#   relationships: [
+#     {
+#       callee: "...",
+#       caller: "...",
+#       file: "...",
+#       line: 123
+#     }
+#   ]
+# }
+sub write_json_report {
+    my ( $json_path, $definitions, $callers_of, $project_dir ) = @_;
+
+    die "[-] Invalid arguments to write_json_report\n"
+      unless defined $json_path
+      && ref($definitions) eq 'HASH'
+      && ref($callers_of) eq 'HASH';
+
+    my $path_base = defined $project_dir ? dirname($project_dir) : undef;
+
+    my %counts = count_kinds($definitions);
+
+    my $total_symbols = 0;
+    $total_symbols += $_ for values %counts;
+
+    my %file_count;
+    my $total_relationships = 0;
+
+    my @relationships;
+    my %seen_relationships;
+
+    for my $callee ( sort keys %$callers_of ) {
+        for my $call ( @{ $callers_of->{$callee} // [] } ) {
+            next unless ref($call) eq 'HASH';
+
+            my $caller = $call->{caller} // '';
+            my $file   = $call->{file}   // '';
+            my $line   = 0 + ( $call->{line} // 0 );
+
+            # Avoid duplicate edges while preserving deterministic output.
+            my $key = join "\0", $callee, $caller, $file, $line;
+            next if $seen_relationships{$key}++;
+
+            push @relationships,
+              {
+                callee => $callee,
+                caller => $caller,
+                file   => shorten_path( $file, $path_base ),
+                line   => $line,
+              };
+
+            $file_count{$file}++;
+            $total_relationships++;
+        }
+    }
+
+    my @files;
+
+    for my $file ( sort keys %$definitions ) {
+        my @symbols;
+
+        for my $name ( sorted_symbol_names( $definitions->{$file} ) ) {
+            my $info = $definitions->{$file}{$name};
+            my $kind = $info->{kind};
+
+            my %symbol = (
+                name      => $name,
+                kind      => $kind,
+                kind_name => $KIND_LABEL{$kind} // '',
+                line      => 0 + ( $info->{line} // 0 ),
+            );
+
+            # Keep optional fields explicit only when ctags supplied them.
+            if ( defined $info->{signature} && length $info->{signature} ) {
+                $symbol{signature} = $info->{signature};
+            }
+
+            if ( defined $info->{return_type} && length $info->{return_type} ) {
+                $symbol{return_type} = $info->{return_type};
+            }
+
+            # Make the call graph directly navigable from each symbol.
+            if ( exists $callers_of->{$name} ) {
+                my @callers;
+                my %seen_callers;
+
+                for my $call ( @{ $callers_of->{$name} // [] } ) {
+                    next unless ref($call) eq 'HASH';
+
+                    my $caller    = $call->{caller} // '';
+                    my $call_file = $call->{file}   // '';
+                    my $call_line = 0 + ( $call->{line} // 0 );
+
+                    # The text report deduplicates callers by symbol name.
+                    # Preserve that useful property here as well.
+                    next if $seen_callers{$caller}++;
+
+                    push @callers,
+                      {
+                        name => $caller,
+                        file => shorten_path( $call_file, $path_base ),
+                        line => $call_line,
+                      };
+                }
+
+                $symbol{callers} = \@callers;
+            }
+            else {
+                $symbol{callers} = [];
+            }
+
+            push @symbols, \%symbol;
+        }
+
+        push @files,
+          {
+            path    => shorten_path( $file, $path_base ),
+            symbols => \@symbols,
+          };
+    }
+
+    my %report = (
+        schema_version => '1.0',
+
+        project => {
+            path => defined $project_dir ? $project_dir : '',
+        },
+
+        summary => {
+            files         => scalar(@files),
+            symbols       => $total_symbols,
+            relationships => $total_relationships,
+
+            kinds => {
+                function  => 0 + ( $counts{f} // 0 ),
+                prototype => 0 + ( $counts{p} // 0 ),
+                member    => 0 + ( $counts{m} // 0 ),
+                class     => 0 + ( $counts{c} // 0 ),
+            },
+        },
+
+        files         => \@files,
+        relationships => \@relationships,
+    );
+
+    open my $fh, '>', $json_path
+      or die "[-] Cannot open JSON analysis file: $!\n";
+
+    # JSON::PP
+    print {$fh} JSON::PP->new->utf8->canonical->pretty->encode( \%report );
+
+    close $fh
+      or die "[-] Cannot write JSON analysis file: $!\n";
+
+    return;
+}
+
 sub write_text_report {
     my ( $report_path, $definitions, $callers_of, $project_dir, $format ) = @_;
     $format //= {};
@@ -719,7 +902,7 @@ sub svg_escape {
 
 # ----------------------------------------------------------------------
 sub print_summary {
-    my ( $db_path, $report_path, $csv_path, $svg_path ) = @_;
+    my ( $db_path, $report_path, $csv_path, $json_path, $svg_path ) = @_;
     print <<"SUMMARY";
 
 [SUCCESS] Pipeline completed successfully!
@@ -733,7 +916,10 @@ sub print_summary {
 3. CSV relationship export:
    $csv_path
 
-4. SVG call graph:
+4. AI/JSON analysis report:
+   $json_path
+
+5. SVG call graph:
    $svg_path
 --------------------------------------------------
 SUMMARY
