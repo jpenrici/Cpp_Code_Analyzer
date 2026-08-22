@@ -1,0 +1,8 @@
+{
+  "out": "analysis_output",
+  "kind": "fp",
+  "no_line": false,
+  "no_label": false,
+  "no_call": false,
+  "yes": true
+}

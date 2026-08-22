@@ -32,7 +32,8 @@ use JSON::PP qw(encode_json);
 use constant {
     SOURCE_EXT_RE  => qr/\.(?:c|cpp|cxx|cc|h|hpp|hxx|hh)$/i,
     SKIP_DIR_RE    => qr/^(?:\.git|\.svn|\.hg|build|cmake-build.*|out)$/i,
-    DEFAULT_OUTDIR => 'output_codequery',
+    DEFAULT_OUTDIR => 'output',
+    CONFIG_PATH    => 'config.json',
 };
 
 # Kinds we care about when scanning ctags output:
@@ -58,12 +59,19 @@ sub main {
 
     my $opts = parse_arguments(@ARGV);
     die usage() if ( $opts->{in} eq "" );
-    my $kind_filter = normalize_kind_selection( $opts->{kind} );
+
+    my $project_dir = resolve_project_dir( $opts->{in} );
+
+    my $config = load_project_config($project_dir);
+    apply_config_defaults( $opts, $config );
+
+    my $kind_filter =
+      normalize_kind_selection( $opts->{kind} // join( '', @ALL_KINDS ) );
 
     require_tools_or_die(qw(ctags cscope cqmakedb));
 
-    my $project_dir = resolve_project_dir( $opts->{in} );
-    my $output_dir  = resolve_output_dir( $opts->{out}, $opts->{yes} );
+    my $output_dir =
+      resolve_output_dir( $opts->{out} // DEFAULT_OUTDIR, $opts->{yes} );
 
     say "[*] Scanning project directory: $project_dir";
     say "[*] Saving output artifacts to: $output_dir\n";
@@ -82,10 +90,12 @@ sub main {
     my $db_path         = File::Spec->catfile( $output_dir, 'codequery.db' );
     my $report_path =
       File::Spec->catfile( $output_dir,
-        report_filename( $opts, $kind_filter ) );
-    my $csv_path  = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
-    my $json_path = File::Spec->catfile( $output_dir, 'cpp_ai_report.json' );
-    my $svg_path  = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
+        report_filename( $opts, $kind_filter, 'txt' ) );
+    my $csv_path = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
+    my $json_path =
+      File::Spec->catfile( $output_dir,
+        report_filename( $opts, $kind_filter, 'json' ) );
+    my $svg_path = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
 
     say "[3/8] Running ctags...";
     run_ctags( $cscope_files_path, $tags_path );
@@ -103,20 +113,17 @@ sub main {
     my %callers_of = build_caller_map( \%definitions, $cscope_out_path );
 
     say "[8/8] Writing text, CSV, JSON and SVG reports...";
-    write_text_report(
-        $report_path,
-        \%definitions,
-        \%callers_of,
-        $project_dir,
-        {
-            hide_labels    => $opts->{no_label},
-            hide_lines     => $opts->{no_line},
-            hide_called_by => $opts->{no_call},
-            kind           => $kind_filter,
-        }
-    );
-    write_csv_report( $csv_path, \%callers_of );
-    write_json_report( $json_path, \%definitions, \%callers_of, $project_dir );
+    my $format = {
+        hide_labels    => $opts->{no_label},
+        hide_lines     => $opts->{no_line},
+        hide_called_by => $opts->{no_call},
+        kind           => $kind_filter,
+    };
+    write_text_report( $report_path, \%definitions, \%callers_of,
+        $project_dir, $format );
+    write_csv_report( $csv_path, \%callers_of, $project_dir );
+    write_json_report( $json_path, \%definitions, \%callers_of, $project_dir,
+        $format );
     write_svg_call_graph( $svg_path, \%callers_of );
 
     print_summary( $db_path, $report_path, $csv_path, $json_path, $svg_path );
@@ -139,11 +146,11 @@ sub parse_arguments {
 
     my %opts = (
         in       => "",
-        out      => DEFAULT_OUTDIR,
+        out      => undef,
         no_line  => 0,
         no_label => 0,
         no_call  => 0,
-        kind     => join( '', @ALL_KINDS ),    # default: fpmc (all kinds)
+        kind     => undef,
         yes      => 0,
     );
     GetOptions(
@@ -182,6 +189,75 @@ sub normalize_kind_selection {
     return [ grep { $requested{$_} } @ALL_KINDS ];
 }
 
+# It looks for a path to "config.json"; if it exists, it loads
+# it as a source of default values ​​for the options
+# (out/kind/no_line/no_label/no_call/yes).
+# This allows the project to define its own preferred flags
+# without needing to repeat them on every invocation.
+# It returns {} when no configuration file exists.
+#
+# Example config.json:
+#   {
+#     "out": "output_codequery",
+#     "kind": "fp",
+#     "no_line": false,
+#     "no_label": false,
+#     "no_call": false,
+#     "yes": false
+#   }
+sub load_project_config {
+    my ($project_dir) = @_;
+
+    my $config_path = CONFIG_PATH;
+    return {} unless -f $config_path;
+
+    open my $fh, '<', $config_path
+      or die "[-] Cannot open $config_path: $!\n";
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+
+    my $data = eval { JSON::PP->new->decode($raw) };
+    die "Error: invalid JSON in $config_path: $@\n" if $@;
+    die "Error: $config_path must contain a JSON object.\n"
+      unless ref($data) eq 'HASH';
+
+    my %known_keys =
+      map { $_ => 1 } qw(out kind no_line no_label no_call yes);
+    my %config;
+    for my $key ( keys %$data ) {
+        unless ( $known_keys{$key} ) {
+            warn "Warning: unknown key '$key' in $config_path (ignored).\n";
+            next;
+        }
+        $config{$key} = $data->{$key};
+    }
+
+    say "[*] Loaded project config: $config_path";
+    return \%config;
+}
+
+# Fills in $opts values left unset on the CLI (out/kind are undef, the
+# hide_*/yes booleans are still 0) from the loaded config. Precedence is
+# CLI > config > built-in default.
+sub apply_config_defaults {
+    my ( $opts, $config ) = @_;
+    return unless %$config;
+
+    for my $bool_key (qw(no_line no_label no_call yes)) {
+        next if $opts->{$bool_key};    # explicit CLI flag always wins
+        next unless exists $config->{$bool_key};
+        $opts->{$bool_key} = $config->{$bool_key} ? 1 : 0;
+    }
+
+    $opts->{out} = $config->{out}
+      if !defined $opts->{out} && defined $config->{out};
+    $opts->{kind} = $config->{kind}
+      if !defined $opts->{kind} && defined $config->{kind};
+
+    return;
+}
+
 sub usage {
     return <<"HELP";
 Usage:
@@ -206,6 +282,11 @@ Note:
     cpp_relationships__kind_fp.txt
     cpp_relationships__kind_fp__no_label__no_call.txt
 
+  If a ".cpp_inspector.json" file exists at the root of --in, its values
+  (out/kind/no_line/no_label/no_call/yes) are used as defaults. Explicit
+  CLI flags always take precedence over the config file. Example:
+    { "kind": "fp", "no_line": true }
+
 Examples:
   perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder
   perl $0 --in=./my_project --kind=fp --no_line
@@ -213,8 +294,6 @@ Examples:
 HELP
 }
 
-# Looks up an executable in $ENV{PATH} without shelling out to `which`,
-# so the script has one less external-command dependency.
 sub find_tool_in_path {
     my ($tool) = @_;
     for my $dir ( split /:/, $ENV{PATH} // '' ) {
@@ -251,9 +330,6 @@ sub resolve_output_dir {
 
     unless ( -d $raw_path ) {
 
-        # Show the path as it would resolve *before* creating anything, so a
-        # typo (e.g. "~/Download/Result" instead of "~/Downloads/Result") is
-        # caught here instead of silently producing a new, empty directory.
         my $would_be_path = File::Spec->rel2abs($raw_path);
         confirm_or_die(
             "[?] Output directory does not exist: $would_be_path\n"
@@ -266,12 +342,6 @@ sub resolve_output_dir {
     return abs_path($raw_path);
 }
 
-# Prompts the user with a yes/no question and dies (aborting the whole
-# script) on anything other than an explicit "y"/"yes". Skips the prompt
-# entirely when $auto_yes is true (--yes/-y), for use in scripts/CI where
-# no interactive terminal is attached. If STDIN isn't interactive and
-# --yes wasn't given, this fails safe (treated as "no") rather than
-# hanging or silently proceeding.
 sub confirm_or_die {
     my ( $prompt, $auto_yes ) = @_;
     return if $auto_yes;
@@ -286,14 +356,15 @@ sub confirm_or_die {
     return;
 }
 
-# Builds the text report's filename, appending a suffix for each active
-# formatting flag (in a fixed order) so that runs with different flags
-# don't overwrite each other's report in the same output directory. E.g.:
-#   cpp_relationships.txt
-#   cpp_relationships__kind_fp.txt
-#   cpp_relationships__kind_fp__no_label__no_call.txt
+# Builds a report filename, appending a suffix for each active formatting
+# flag (in a fixed order) so runs with different flags don't overwrite
+# each other's report in the same output directory. Used for both the
+# text and JSON reports, since both honor the same hide_*/kind flags. E.g.:
+#   cpp_relationships.txt / .json
+#   cpp_relationships__kind_fp.txt / .json
+#   cpp_relationships__kind_fp__no_label__no_call.txt / .json
 sub report_filename {
-    my ( $opts, $kind_filter ) = @_;
+    my ( $opts, $kind_filter, $extension ) = @_;
 
     my @suffix;
     push @suffix, 'kind_' . join( '', @$kind_filter )
@@ -304,7 +375,7 @@ sub report_filename {
 
     my $name = 'cpp_relationships';
     $name .= '__' . join( '__', @suffix ) if @suffix;
-    return "$name.txt";
+    return "$name.$extension";
 }
 
 # ----------------------------------------------------------------------
@@ -398,11 +469,15 @@ sub parse_tags {
 
         my ($return_type) = map { /^typeref:[^:]+:(.*)/ ? $1 : () } @rest;
 
+        my ($scope) =
+          map { /^(?:class|struct|namespace|union):(.*)/ ? $1 : () } @rest;
+
         $definitions{$file}{$name} = {
             kind        => $kind,
             line        => $line_num,
             signature   => $signature,
             return_type => $return_type,
+            scope       => $scope,
         };
     }
     close $fh;
@@ -467,133 +542,95 @@ sub find_callers {
 # Top-level structure:
 # {
 #   schema_version: "1.0",
-#   project: "...",
+#   project: {...},
+#   options: { kind, hide_labels, hide_lines, hide_called_by },
 #   summary: {...},
-#   files: [
-#     {
-#       path: "...",
-#       symbols: [
-#         {
-#           name: "...",
-#           kind: "f",
-#           kind_name: "Function",
-#           line: 123,
-#           signature: "...",
-#           return_type: "...",
-#           callers: [...]
-#         }
-#       ]
-#     }
-#   ],
-#   relationships: [
-#     {
-#       callee: "...",
-#       caller: "...",
-#       file: "...",
-#       line: 123
-#     }
-#   ]
+#   files: [ { path, symbols: [ { name, kind, kind_name, line, signature,
+#                                 return_type, callers: [...] } ] } ],
+#   relationships: [ { callee, caller, file, line } ]
 # }
 sub write_json_report {
-    my ( $json_path, $definitions, $callers_of, $project_dir ) = @_;
+    my ( $json_path, $definitions, $callers_of, $project_dir, $format ) = @_;
 
     die "[-] Invalid arguments to write_json_report\n"
       unless defined $json_path
       && ref($definitions) eq 'HASH'
       && ref($callers_of) eq 'HASH';
 
+    $format //= {};
+    my $hide_labels    = $format->{hide_labels};
+    my $hide_lines     = $format->{hide_lines};
+    my $hide_called_by = $format->{hide_called_by};
+    my $kind_filter    = $format->{kind} // \@ALL_KINDS;
+    my %allowed_kind   = map { $_ => 1 } @$kind_filter;
+
     my $path_base = defined $project_dir ? dirname($project_dir) : undef;
 
-    my %counts = count_kinds($definitions);
-
-    my $total_symbols = 0;
-    $total_symbols += $_ for values %counts;
-
-    my %file_count;
-    my $total_relationships = 0;
-
-    my @relationships;
-    my %seen_relationships;
-
-    for my $callee ( sort keys %$callers_of ) {
-        for my $call ( @{ $callers_of->{$callee} // [] } ) {
-            next unless ref($call) eq 'HASH';
-
-            my $caller = $call->{caller} // '';
-            my $file   = $call->{file}   // '';
-            my $line   = 0 + ( $call->{line} // 0 );
-
-            # Avoid duplicate edges while preserving deterministic output.
-            my $key = join "\0", $callee, $caller, $file, $line;
-            next if $seen_relationships{$key}++;
-
-            push @relationships,
-              {
-                callee => $callee,
-                caller => $caller,
-                file   => shorten_path( $file, $path_base ),
-                line   => $line,
-              };
-
-            $file_count{$file}++;
-            $total_relationships++;
+    my %kind_of_name;
+    for my $file ( sort keys %$definitions ) {
+        for my $name ( keys %{ $definitions->{$file} } ) {
+            $kind_of_name{$name} //= $definitions->{$file}{$name}{kind};
         }
     }
 
+    my %counts;
+    my $total_symbols = 0;
     my @files;
 
     for my $file ( sort keys %$definitions ) {
-        my @symbols;
+        my @names =
+          grep { $allowed_kind{ $definitions->{$file}{$_}{kind} } }
+          sorted_symbol_names( $definitions->{$file} );
+        next unless @names;    # skip files with nothing left after filtering
 
-        for my $name ( sorted_symbol_names( $definitions->{$file} ) ) {
+        my @symbols;
+        for my $name (@names) {
             my $info = $definitions->{$file}{$name};
             my $kind = $info->{kind};
+            $counts{$kind}++;
+            $total_symbols++;
 
-            my %symbol = (
-                name      => $name,
-                kind      => $kind,
-                kind_name => $KIND_LABEL{$kind} // '',
-                line      => 0 + ( $info->{line} // 0 ),
-            );
+            my $qualified_name =
+              ( defined $info->{scope} && length $info->{scope} )
+              ? "$info->{scope}::$name"
+              : $name;
+            my %symbol = ( name => $name, qualified_name => $qualified_name );
 
-            # Keep optional fields explicit only when ctags supplied them.
+            unless ($hide_labels) {
+                $symbol{kind}      = $kind;
+                $symbol{kind_name} = $KIND_LABEL{$kind} // '';
+            }
+            unless ($hide_lines) {
+                $symbol{line} = 0 + ( $info->{line} // 0 );
+            }
             if ( defined $info->{signature} && length $info->{signature} ) {
                 $symbol{signature} = $info->{signature};
             }
-
-            if ( defined $info->{return_type} && length $info->{return_type} ) {
+            if ( defined $info->{return_type}
+                && length $info->{return_type} )
+            {
                 $symbol{return_type} = $info->{return_type};
             }
 
-            # Make the call graph directly navigable from each symbol.
-            if ( exists $callers_of->{$name} ) {
-                my @callers;
+            my @callers;
+            unless ($hide_called_by) {
                 my %seen_callers;
-
                 for my $call ( @{ $callers_of->{$name} // [] } ) {
                     next unless ref($call) eq 'HASH';
-
-                    my $caller    = $call->{caller} // '';
-                    my $call_file = $call->{file}   // '';
-                    my $call_line = 0 + ( $call->{line} // 0 );
-
-                    # The text report deduplicates callers by symbol name.
-                    # Preserve that useful property here as well.
+                    my $caller = $call->{caller} // '';
                     next if $seen_callers{$caller}++;
 
-                    push @callers,
-                      {
+                    my %caller_entry = (
                         name => $caller,
-                        file => shorten_path( $call_file, $path_base ),
-                        line => $call_line,
-                      };
-                }
+                        file => shorten_path( $call->{file} // '', $path_base ),
+                    );
+                    $caller_entry{line} = 0 + ( $call->{line} // 0 )
+                      unless $hide_lines;
 
-                $symbol{callers} = \@callers;
+                    push @callers, \%caller_entry;
+                }
             }
-            else {
-                $symbol{callers} = [];
-            }
+            $symbol{callers} = \@callers;
 
             push @symbols, \%symbol;
         }
@@ -605,11 +642,54 @@ sub write_json_report {
           };
     }
 
+    my @relationships;
+    my $total_relationships = 0;
+    unless ($hide_called_by) {
+        my %seen_relationships;
+        for my $callee ( sort keys %$callers_of ) {
+            next
+              if exists $kind_of_name{$callee}
+              && !$allowed_kind{ $kind_of_name{$callee} };
+
+            for my $call ( @{ $callers_of->{$callee} // [] } ) {
+                next unless ref($call) eq 'HASH';
+
+                my $caller = $call->{caller} // '';
+                my $file   = $call->{file}   // '';
+                my $line   = 0 + ( $call->{line} // 0 );
+
+                my $key = join "\0", $callee, $caller, $file, $line;
+                next if $seen_relationships{$key}++;
+
+                my %relationship = (
+                    callee => $callee,
+                    caller => $caller,
+                    file   => shorten_path( $file, $path_base ),
+                );
+                $relationship{line} = $line unless $hide_lines;
+
+                push @relationships, \%relationship;
+                $total_relationships++;
+            }
+        }
+    }
+
     my %report = (
         schema_version => '1.0',
 
         project => {
-            path => defined $project_dir ? $project_dir : '',
+            path => defined $project_dir
+            ? shorten_path( $project_dir, $path_base )
+            : '',
+        },
+
+        options => {
+            kind           => $kind_filter,
+            hide_labels    => $hide_labels ? JSON::PP::true : JSON::PP::false,
+            hide_lines     => $hide_lines  ? JSON::PP::true : JSON::PP::false,
+            hide_called_by => $hide_called_by
+            ? JSON::PP::true
+            : JSON::PP::false,
         },
 
         summary => {
@@ -631,10 +711,7 @@ sub write_json_report {
 
     open my $fh, '>', $json_path
       or die "[-] Cannot open JSON analysis file: $!\n";
-
-    # JSON::PP
     print {$fh} JSON::PP->new->utf8->canonical->pretty->encode( \%report );
-
     close $fh
       or die "[-] Cannot write JSON analysis file: $!\n";
 
@@ -760,7 +837,7 @@ sub sorted_symbol_names {
 # CSV export: one row per unique (callee, caller) edge, easy to load into
 # spreadsheets or graph-analysis tools.
 sub write_csv_report {
-    my ( $csv_path, $callers_of ) = @_;
+    my ( $csv_path, $callers_of, $project_dir ) = @_;
 
     open my $fh, '>', $csv_path or die "[-] Cannot open CSV file: $!\n";
     print {$fh} "callee,caller,file,line\n";
@@ -770,11 +847,14 @@ sub write_csv_report {
         for my $call ( @{ $callers_of->{$callee} } ) {
             my $key = "$call->{caller}\0$call->{file}\0$call->{line}";
             next if $seen{$key}++;
+
+            my $path_base =
+              defined $project_dir ? dirname($project_dir) : undef;
+            my $file = shorten_path( $call->{file}, $path_base );
+
             print {$fh} join( ',',
-                csv_escape($callee),
-                csv_escape( $call->{caller} ),
-                csv_escape( $call->{file} ),
-                csv_escape( $call->{line} ),
+                csv_escape($callee), csv_escape( $call->{caller} ),
+                csv_escape($file),   csv_escape( $call->{line} ),
               ),
               "\n";
         }
