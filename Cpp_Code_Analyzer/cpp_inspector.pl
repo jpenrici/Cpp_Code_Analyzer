@@ -6,7 +6,7 @@
 #              C/C++ projects by automatically running ctags, cscope and
 #              cqmakedb.
 # Usage:       perl cpp_inspector.pl [--in=<path>] [--out=<path>] [--yes]
-#                                     [--kind=<letters>]
+#                                     [--kind=<letters>] [--ignore_config]
 #                                     [--no_label] [--no_line] [--no_call]
 # Requirements: ctags, cscope, cqmakedb
 #
@@ -32,8 +32,7 @@ use JSON::PP qw(encode_json);
 use constant {
     SOURCE_EXT_RE  => qr/\.(?:c|cpp|cxx|cc|h|hpp|hxx|hh)$/i,
     SKIP_DIR_RE    => qr/^(?:\.git|\.svn|\.hg|build|cmake-build.*|out)$/i,
-    DEFAULT_OUTDIR => 'output',
-    CONFIG_PATH    => 'config.json',
+    DEFAULT_OUTDIR => 'output'
 };
 
 # Kinds we care about when scanning ctags output:
@@ -62,8 +61,10 @@ sub main {
 
     my $project_dir = resolve_project_dir( $opts->{in} );
 
-    my $config = load_project_config($project_dir);
-    apply_config_defaults( $opts, $config );
+    if ( !$ops->{ignore_config} ) {
+        my $config = load_project_config($project_dir);
+        apply_config_defaults( $opts, $config );
+    }
 
     my $kind_filter =
       normalize_kind_selection( $opts->{kind} // join( '', @ALL_KINDS ) );
@@ -145,23 +146,25 @@ sub parse_arguments {
     local @ARGV = @_;
 
     my %opts = (
-        in       => "",
-        out      => undef,
-        no_line  => 0,
-        no_label => 0,
-        no_call  => 0,
-        kind     => undef,
-        yes      => 0,
+        in            => "",
+        out           => undef,
+        no_line       => 0,
+        no_label      => 0,
+        no_call       => 0,
+        ignore_config => 0,
+        kind          => undef,
+        yes           => 0,
     );
     GetOptions(
-        'in=s'     => \$opts{in},
-        'out=s'    => \$opts{out},
-        'no_line'  => \$opts{no_line},
-        'no_label' => \$opts{no_label},
-        'no_call'  => \$opts{no_call},
-        'kind=s'   => \$opts{kind},
-        'yes|y'    => \$opts{yes},
-        'help|h'   => sub { print usage(); exit 0; },
+        'in=s'          => \$opts{in},
+        'out=s'         => \$opts{out},
+        'no_line'       => \$opts{no_line},
+        'no_label'      => \$opts{no_label},
+        'no_call'       => \$opts{no_call},
+        'ignore_config' => \$opts{ignore_config},
+        'kind=s'        => \$opts{kind},
+        'yes|y'         => \$opts{yes},
+        'help|h'        => sub { print usage(); exit 0; },
     ) or die usage();
 
     return \%opts;
@@ -208,7 +211,7 @@ sub normalize_kind_selection {
 sub load_project_config {
     my ($project_dir) = @_;
 
-    my $config_path = CONFIG_PATH;
+    my $config_path = File::Spec::catfile($project_dir, "config.json");
     return {} unless -f $config_path;
 
     open my $fh, '<', $config_path
@@ -264,17 +267,18 @@ Usage:
   perl $0 [options]
 
 Options:
-  --in=<path>    Path to the C++ project directory to scan (default: current directory)
-  --out=<path>   Path to the output directory where artifacts will be saved (default: @{[ DEFAULT_OUTDIR ]})
-  --kind=<letters>  Keep only the given symbol kinds in cpp_relationships.txt (default: fpmc)
-                     f=Function  p=Prototype  m=Member  c=Class
-                     e.g. --kind=fp keeps functions and prototypes, hides members/classes
-  --no_label     Hide the [f/p/m/c] kind label for each symbol in cpp_relationships.txt
-  --no_line      Hide the "| Line: N" suffix for each symbol in cpp_relationships.txt
-  --no_call      Hide the "Called by:" section in cpp_relationships.txt
-  --yes, -y      Skip the confirmation prompt when --out doesn't exist yet
-                  (creates it automatically - useful for scripts/CI)
-  --help, -h     Display this help message and exit
+  --in=<path>      Path to the C++ project directory to scan (default: current directory)
+  --out=<path>     Path to the output directory where artifacts will be saved (default: @{[ DEFAULT_OUTDIR ]})
+  --kind=<letters> Keep only the given symbol kinds in cpp_relationships.txt (default: fpmc)
+                      f=Function  p=Prototype  m=Member  c=Class
+                      e.g. --kind=fp keeps functions and prototypes, hides members/classes
+  --no_label       Hide the [f/p/m/c] kind label for each symbol in cpp_relationships.txt
+  --no_line        Hide the "| Line: N" suffix for each symbol in cpp_relationships.txt
+  --no_call        Hide the "Called by:" section in cpp_relationships.txt
+  --ignore_config  Ignore config.json even if it is present
+  --yes, -y        Skip the confirmation prompt when --out doesn't exist yet
+                      (creates it automatically - useful for scripts/CI)
+  --help, -h       Display this help message and exit
 
 Note:
   The text report filename gets a suffix for each active flag above, e.g.:
