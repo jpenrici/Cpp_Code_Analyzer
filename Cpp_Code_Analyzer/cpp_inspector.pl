@@ -6,8 +6,9 @@
 #              C/C++ projects by automatically running ctags, cscope and
 #              cqmakedb.
 # Usage:       perl cpp_inspector.pl [--in=<path>] [--out=<path>] [--yes]
-#                                     [--kind=<letters>] [--ignore_config]
-#                                     [--no_label] [--no_line] [--no_call]
+#                                     [--config=<path/config.json>] [--ignore_config]
+#                                     [--kind=<letters>] [--no_label] [--no_line] [--no_call]
+#
 # Requirements: ctags, cscope, cqmakedb
 #
 # Reference:
@@ -61,8 +62,14 @@ sub main {
 
     my $project_dir = resolve_project_dir( $opts->{in} );
 
-    if ( !$ops->{ignore_config} ) {
-        my $config = load_project_config($project_dir);
+    unless ( $opts->{ignore_config} ) {
+
+        # Path to the directory containing config.json
+        my $config_dir =
+          length( $opts->{config_dir} ) ? $opts->{config_dir} : $project_dir;
+
+        # Load, verify, and apply custom configuration
+        my $config = load_project_config($config_dir);
         apply_config_defaults( $opts, $config );
     }
 
@@ -148,6 +155,7 @@ sub parse_arguments {
     my %opts = (
         in            => "",
         out           => undef,
+        config_dir    => "",
         no_line       => 0,
         no_label      => 0,
         no_call       => 0,
@@ -158,6 +166,7 @@ sub parse_arguments {
     GetOptions(
         'in=s'          => \$opts{in},
         'out=s'         => \$opts{out},
+        'config=s'      => \$opts{config_dir},
         'no_line'       => \$opts{no_line},
         'no_label'      => \$opts{no_label},
         'no_call'       => \$opts{no_call},
@@ -209,9 +218,10 @@ sub normalize_kind_selection {
 #     "yes": false
 #   }
 sub load_project_config {
-    my ($project_dir) = @_;
+    my ($config_dir) = @_;
 
-    my $config_path = File::Spec::catfile($project_dir, "config.json");
+    # Path to the configuration file
+    my $config_path = File::Spec->catfile( $config_dir, "config.json" );
     return {} unless -f $config_path;
 
     open my $fh, '<', $config_path
@@ -269,6 +279,7 @@ Usage:
 Options:
   --in=<path>      Path to the C++ project directory to scan (default: current directory)
   --out=<path>     Path to the output directory where artifacts will be saved (default: @{[ DEFAULT_OUTDIR ]})
+  --config=<path>  Path to the configuration directory (default: project path)
   --kind=<letters> Keep only the given symbol kinds in cpp_relationships.txt (default: fpmc)
                       f=Function  p=Prototype  m=Member  c=Class
                       e.g. --kind=fp keeps functions and prototypes, hides members/classes
@@ -286,14 +297,14 @@ Note:
     cpp_relationships__kind_fp.txt
     cpp_relationships__kind_fp__no_label__no_call.txt
 
-  If a ".cpp_inspector.json" file exists at the root of --in, its values
+  If a "config.json" file exists at the root of --in, its values
   (out/kind/no_line/no_label/no_call/yes) are used as defaults. Explicit
   CLI flags always take precedence over the config file. Example:
     { "kind": "fp", "no_line": true }
 
 Examples:
-  perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder
-  perl $0 --in=./my_project --kind=fp --no_line
+  perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder --config=/path/to/cpp/project
+  perl $0 --in=./my_project --kind=fp --no_line --ignore_config
   perl $0 --in=./my_project --out=./ci_output --yes   # non-interactive (CI)
 HELP
 }
@@ -970,7 +981,7 @@ sub svg_wrap {
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="$width" height="$height"
      viewBox="0 0 $width $height">
-  <rect width="100%" height="100%" fill="white" />
+  <rect x="0" y="0" width="$width" height="$height" fill="white" />
 $body
 </svg>
 SVG

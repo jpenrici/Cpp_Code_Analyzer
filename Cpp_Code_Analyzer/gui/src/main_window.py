@@ -81,12 +81,18 @@ class MainWindow(QMainWindow):
         output_row = self._path_row(self.output_edit, self._browse_output)
         paths_form.addRow("Output dir (--out)", output_row)
 
-        self.config_edit = QLineEdit()
-        self.config_edit.setPlaceholderText("Path to config.json")
-        config_row = self._path_row(self.config_edit, self._browse_config)
-        paths_form.addRow("Config path", config_row)
+        self.config_dir_edit = QLineEdit()
+        self.config_dir_edit.setPlaceholderText("Path to configuration directory")
+        config_row = self._path_row(self.config_dir_edit, self._browse_config)
+        paths_form.addRow("Config dir (--config)", config_row)
+
+        self.ignore_config_check = QCheckBox("Ignore config.json (--ignore_config)")
+        self.ignore_config_check.toggled.connect(
+            lambda checked: self.config_dir_edit.setEnabled(not checked)
+        )
 
         layout.addWidget(paths_box)
+        layout.addWidget(self.ignore_config_check)
 
         # --- Symbol kinds ------------------------------------------------
         kinds_box = QGroupBox("Symbol kinds (--kind)")
@@ -120,7 +126,7 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self.stop_button)
         layout.addLayout(actions_layout)
 
-        self.save_config_button = QPushButton("Save options as project config.json")
+        self.save_config_button = QPushButton("Save current options to config.json")
         self.save_config_button.clicked.connect(self._on_save_config_clicked)
         layout.addWidget(self.save_config_button)
 
@@ -213,17 +219,17 @@ class MainWindow(QMainWindow):
             self.output_edit.setToolTip(path)
 
     def _browse_config(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select config file", ".", filter="JSON Files (*.json);;All Files (*)"
-        )
-        if file_path:
-            self.config_edit.setText(file_path)
-            self.config_edit.setToolTip(file_path)
+        path = QFileDialog.getExistingDirectory(self, "Select config directory")
+        if path:
+            self.config_dir_edit.setText(path)
+            self.config_dir_edit.setToolTip(path)
 
     def _sync_default_output(self, project_path: str) -> None:
         # Only auto-fill; never clobber a value the user typed themselves.
         if project_path and not self.output_edit.text():
             self.output_edit.setText(str(Path(project_path) / "output"))
+        if project_path and not self.config_dir_edit.text():
+            self.config_dir_edit.setText(str(Path(project_path)))
 
     # ------------------------------------------------------------------
     # Run / stop
@@ -233,17 +239,27 @@ class MainWindow(QMainWindow):
         output_dir = self.output_edit.text().strip() or str(
             Path(project_dir) / "output"
         )
+        config_dir = self.config_dir_edit.text().strip()
 
         if not project_dir:
             QMessageBox.warning(
                 self, "Missing project", "Please choose a project directory first."
             )
             return None
+
         if not Path(project_dir).is_dir():
             QMessageBox.warning(
                 self, "Invalid project", f"'{project_dir}' is not a directory."
             )
             return None
+
+        if config_dir and not Path(config_dir).is_dir():
+            QMessageBox.warning(
+                self,
+                "Invalid Config directory",
+                f"Failed to use '{config_dir}'. Ignoring config.json.",
+            )
+            config_dir = ""
 
         kinds = "".join(
             letter for letter, cb in self.kind_checks.items() if cb.isChecked()
@@ -257,10 +273,12 @@ class MainWindow(QMainWindow):
         return RunOptions(
             project_dir=project_dir,
             output_dir=output_dir,
+            config_dir=config_dir,
             kinds=kinds,
             no_label=self.no_label_check.isChecked(),
             no_line=self.no_line_check.isChecked(),
             no_call=self.no_call_check.isChecked(),
+            ignore_config=self.ignore_config_check.isChecked(),
         )
 
     def _on_run_clicked(self) -> None:
@@ -410,7 +428,12 @@ class MainWindow(QMainWindow):
         options = self._collect_options()
         if options is None:
             return
-        config_path = Path(options.project_dir) / "config.json"
+
+        config_dir = self.config_dir_edit.text().strip()
+        if not Path(config_dir).is_dir():
+            config_dir = options.project_dir
+
+        config_path = Path(config_dir) / "config.json"
         payload = {
             "out": options.output_dir,
             "kind": options.kinds,
