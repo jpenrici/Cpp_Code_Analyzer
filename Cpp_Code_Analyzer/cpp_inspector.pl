@@ -5,9 +5,6 @@
 #              a CSV call-relationship export, and an SVG call graph for
 #              C/C++ projects by automatically running ctags, cscope and
 #              cqmakedb.
-# Usage:       perl cpp_inspector.pl [--in=<path>] [--out=<path>] [--yes]
-#                                     [--config=<path/config.json>] [--ignore_config]
-#                                     [--kind=<letters>] [--no_label] [--no_line] [--no_call]
 #
 # Requirements: ctags, cscope, cqmakedb
 #
@@ -54,35 +51,87 @@ main();
 exit 0;
 
 # ----------------------------------------------------------------------
+sub usage {
+    return <<"HELP";
+Usage:
+  perl $0 [options]
+
+Options:
+  --in=<path>      Path to the C++ project directory to scan (default: current directory)
+  --out=<path>     Path to the output directory where artifacts will be saved (default: @{[ DEFAULT_OUTDIR ]})
+  --config=<path>  Path to the configuration directory (default: project path)
+  --kind=<letters> Keep only the given symbol kinds in cpp_relationships.txt (default: fpmc)
+                      f=Function  p=Prototype  m=Member  c=Class
+                      e.g. --kind=fp keeps functions and prototypes, hides members/classes
+  --no_label       Hide the [f/p/m/c] kind label for each symbol in cpp_relationships.txt
+  --no_line        Hide the "| Line: N" suffix for each symbol in cpp_relationships.txt
+  --no_call        Hide the "Called by:" section in cpp_relationships.txt
+  --ignore_config  Ignore config.json even if it is present
+  --yes, -y        Skip the confirmation prompt when --out doesn't exist yet
+                      (creates it automatically - useful for scripts/CI)
+  --help, -h       Display this help message and exit
+
+Note:
+  The text report filename gets a suffix for each active flag above, e.g.:
+    cpp_relationships.txt
+    cpp_relationships__kind_fp.txt
+    cpp_relationships__kind_fp__no_label__no_call.txt
+
+  If a "config.json" file exists at the root of --in, its values
+  (out/kind/no_line/no_label/no_call/yes) are used as defaults. Explicit
+  CLI flags always take precedence over the config file. Example:
+    { "kind": "fp", "no_line": true }
+
+Examples:
+  perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder --config=/path/to/cpp/project
+  perl $0 --in=./my_project --kind=fp --no_line --ignore_config
+  perl $0 --in=./my_project --out=./ci_output --yes   # non-interactive (CI)
+HELP
+}
+
 sub main {
     refuse_to_run_as_root();
+
+    require_tools_or_die(qw(ctags cscope cqmakedb));
 
     my $opts = parse_arguments(@ARGV);
     die usage() if ( $opts->{in} eq "" );
 
     my $project_dir = resolve_project_dir( $opts->{in} );
 
+    # Path to the directory containing config.json
+    my $config_dir = "";
     unless ( $opts->{ignore_config} ) {
-
-        # Path to the directory containing config.json
-        my $config_dir =
+        $config_dir =
           length( $opts->{config_dir} ) ? $opts->{config_dir} : $project_dir;
 
         # Load, verify, and apply custom configuration
         my $config = load_project_config($config_dir);
-        apply_config_defaults( $opts, $config );
+        if (%$config) {
+            apply_config_defaults( $opts, $config );
+        }
+        else {
+            $opts->{ignore_config} = 1;
+        }
     }
 
     my $kind_filter =
       normalize_kind_selection( $opts->{kind} // join( '', @ALL_KINDS ) );
 
-    require_tools_or_die(qw(ctags cscope cqmakedb));
-
     my $output_dir =
       resolve_output_dir( $opts->{out} // DEFAULT_OUTDIR, $opts->{yes} );
 
     say "[*] Scanning project directory: $project_dir";
-    say "[*] Saving output artifacts to: $output_dir\n";
+    say "[*] Saving output artifacts to: $output_dir";
+    say "[*] Current Config directory: $config_dir" unless ( $opts->{ignore_config} );
+
+    say "[*] Current commands: "
+      . ( $opts->{no_label}      ? " --no_label"                   : "" )
+      . ( $opts->{no_line}       ? " --no_line"                    : "" )
+      . ( $opts->{no_call}       ? " --no_call"                    : "" )
+      . ( $opts->{ignore_config} ? " --ignore_config"              : "" )
+      . ( $kind_filter ? " --kinds=" . join( "", @{$kind_filter} ) : "" )
+      . ( $opts->{yes} ? " --yes" : "" ) . "\n";
 
     my @source_files = collect_source_files($project_dir);
     my $total_files  = scalar @source_files;
@@ -219,6 +268,7 @@ sub normalize_kind_selection {
 #   }
 sub load_project_config {
     my ($config_dir) = @_;
+    return {} unless -d $config_dir;
 
     # Path to the configuration file
     my $config_path = File::Spec->catfile( $config_dir, "config.json" );
@@ -269,44 +319,6 @@ sub apply_config_defaults {
       if !defined $opts->{kind} && defined $config->{kind};
 
     return;
-}
-
-sub usage {
-    return <<"HELP";
-Usage:
-  perl $0 [options]
-
-Options:
-  --in=<path>      Path to the C++ project directory to scan (default: current directory)
-  --out=<path>     Path to the output directory where artifacts will be saved (default: @{[ DEFAULT_OUTDIR ]})
-  --config=<path>  Path to the configuration directory (default: project path)
-  --kind=<letters> Keep only the given symbol kinds in cpp_relationships.txt (default: fpmc)
-                      f=Function  p=Prototype  m=Member  c=Class
-                      e.g. --kind=fp keeps functions and prototypes, hides members/classes
-  --no_label       Hide the [f/p/m/c] kind label for each symbol in cpp_relationships.txt
-  --no_line        Hide the "| Line: N" suffix for each symbol in cpp_relationships.txt
-  --no_call        Hide the "Called by:" section in cpp_relationships.txt
-  --ignore_config  Ignore config.json even if it is present
-  --yes, -y        Skip the confirmation prompt when --out doesn't exist yet
-                      (creates it automatically - useful for scripts/CI)
-  --help, -h       Display this help message and exit
-
-Note:
-  The text report filename gets a suffix for each active flag above, e.g.:
-    cpp_relationships.txt
-    cpp_relationships__kind_fp.txt
-    cpp_relationships__kind_fp__no_label__no_call.txt
-
-  If a "config.json" file exists at the root of --in, its values
-  (out/kind/no_line/no_label/no_call/yes) are used as defaults. Explicit
-  CLI flags always take precedence over the config file. Example:
-    { "kind": "fp", "no_line": true }
-
-Examples:
-  perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder --config=/path/to/cpp/project
-  perl $0 --in=./my_project --kind=fp --no_line --ignore_config
-  perl $0 --in=./my_project --out=./ci_output --yes   # non-interactive (CI)
-HELP
 }
 
 sub find_tool_in_path {
