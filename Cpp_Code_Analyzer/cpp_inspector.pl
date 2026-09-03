@@ -186,6 +186,9 @@ sub server_write {
 }
 
 sub run_server {
+
+    $| = 1;    # autoflush STDOUT
+
     while ( my $line = <STDIN> ) {
         chomp $line;
         next unless length $line;

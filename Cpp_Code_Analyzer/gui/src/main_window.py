@@ -6,6 +6,8 @@ options form on the left, a log + report tabs on the right.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -32,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from . import config
 from .report_views import build_report_tabs
-from .runner import InspectorRunner, RunOptions
+from .runner import InspectorServerClient, RunOptions
 
 
 class MainWindow(QMainWindow):
@@ -42,10 +44,19 @@ class MainWindow(QMainWindow):
 
         self._script_path: Path | None = config.find_inspector_script()
         self._perl_binary: str | None = config.find_perl_binary()
-        self._runner: InspectorRunner | None = None
+        self._server: InspectorServerClient | None = None
+        self._current_options: RunOptions | None = None
+        self._collect_request_id: int | None = None
+        self._collect_job_pid: str | None = None
+        self._render_request_id: int | None = None
 
         self._build_ui()
         self._check_environment()
+
+    def closeEvent(self, event) -> None:
+        if self._server is not None:
+            self._server.stop()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -73,6 +84,7 @@ class MainWindow(QMainWindow):
         self.project_edit = QLineEdit()
         self.project_edit.setPlaceholderText("Path to C/C++ project")
         self.project_edit.textChanged.connect(self._sync_default_output)
+        self.project_edit.textChanged.connect(self._sync_default_config_dir)
         project_row = self._path_row(self.project_edit, self._browse_project)
         paths_form.addRow("Project dir (--in)", project_row)
 
@@ -81,19 +93,28 @@ class MainWindow(QMainWindow):
         output_row = self._path_row(self.output_edit, self._browse_output)
         paths_form.addRow("Output dir (--out)", output_row)
 
+        layout.addWidget(paths_box)
+
+        # --- Config file (config.json) ------------------------------------
+        config_box = QGroupBox("Configuration (config.json)")
+        config_form = QFormLayout(config_box)
+
         self.config_dir_edit = QLineEdit()
-        self.config_dir_edit.setPlaceholderText("Path to configuration directory")
-        self.config_dir_edit.textChanged.connect(self._maybe_autoload_config)
-        config_row = self._path_row(self.config_dir_edit, self._browse_config)
-        paths_form.addRow("Config dir (--config)", config_row)
+        self.config_dir_edit.setPlaceholderText("Defaults to the project dir (--in)")
+        config_dir_row = self._path_row(self.config_dir_edit, self._browse_config_dir)
+        self.config_dir_edit.editingFinished.connect(
+            lambda: self._maybe_autoload_config(self.config_dir_edit.text().strip())
+        )
+        config_form.addRow("Config dir (--config)", config_dir_row)
 
         self.ignore_config_check = QCheckBox("Ignore config.json (--ignore_config)")
+        self.ignore_config_check.toggled.connect(self.config_dir_edit.setDisabled)
         self.ignore_config_check.toggled.connect(
-            lambda checked: self.config_dir_edit.setEnabled(not checked)
+            lambda checked: config_dir_row.setDisabled(checked)
         )
+        config_form.addRow("", self.ignore_config_check)
 
-        layout.addWidget(paths_box)
-        layout.addWidget(self.ignore_config_check)
+        layout.addWidget(config_box)
 
         # --- Symbol kinds ------------------------------------------------
         kinds_box = QGroupBox("Symbol kinds (--kind)")
@@ -127,9 +148,13 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self.stop_button)
         layout.addLayout(actions_layout)
 
-        self.save_config_button = QPushButton("Save current options to config.json")
+        self.save_config_button = QPushButton("Save options to config.json")
         self.save_config_button.clicked.connect(self._on_save_config_clicked)
         layout.addWidget(self.save_config_button)
+
+        self.load_config_button = QPushButton("Load options from config.json")
+        self.load_config_button.clicked.connect(self._on_load_config_clicked)
+        layout.addWidget(self.load_config_button)
 
         # --- Environment status -------------------------------------------
         self.env_label = QLabel()
@@ -211,35 +236,36 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select C/C++ project directory")
         if path:
             self.project_edit.setText(path)
-            self.project_edit.setToolTip(path)
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if path:
             self.output_edit.setText(path)
-            self.output_edit.setToolTip(path)
 
-    def _browse_config(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select config directory")
+    def _browse_config_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select directory containing config.json"
+        )
         if path:
             self.config_dir_edit.setText(path)
-            self.config_dir_edit.setToolTip(path)
+            self._maybe_autoload_config(path)
 
-    def _sync_default_output(self, project_path: str) -> None:
-        # Only auto-fill; never clobber a value the user typed themselves.
-        if project_path and not self.output_edit.text():
-            self.output_edit.setText(str(Path(project_path) / "output"))
+    def _sync_default_config_dir(self, project_path: str) -> None:
+        # Mirrors the script's own default (--config falls back to --in).
         if project_path and not self.config_dir_edit.text():
-            self.config_dir_edit.setText(str(Path(project_path)))
+            self.config_dir_edit.setText(project_path)
+            self._maybe_autoload_config(project_path)
 
     def _maybe_autoload_config(self, config_dir: str) -> None:
-        config_dir = config_dir.strip()
-        if not config_dir or not Path(config_dir).is_dir():
+        """If config_dir has a config.json, load its values into the
+        checkboxes so the UI reflects what the script will actually
+        apply — mirrors --config's own default lookup, just done ahead
+        of time so the user sees it before clicking Run."""
+        if not config_dir:
             return
         config_path = Path(config_dir) / "config.json"
         if not config_path.is_file():
             return
-
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -259,35 +285,201 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"Loaded options from {config_path}")
 
+    def _sync_default_output(self, project_path: str) -> None:
+        # Only auto-fill; never clobber a value the user typed themselves.
+        if project_path and not self.output_edit.text():
+            self.output_edit.setText(str(Path(project_path) / "output"))
+
     # ------------------------------------------------------------------
-    # Run / stop
+    # Run / stop — collect() then render() over the persistent --serve
+    # connection (see runner.InspectorServerClient).
     # ------------------------------------------------------------------
+    def _ensure_server(self) -> InspectorServerClient:
+        if self._server is None:
+            self._server = InspectorServerClient(
+                self._perl_binary, self._script_path, self
+            )
+            self._server.job_started.connect(self._on_job_started)
+            self._server.event_received.connect(self._on_event_received)
+            self._server.response_received.connect(self._on_response_received)
+            self._server.raw_output_received.connect(self._append_log)
+            self._server.start_failed.connect(self._on_server_start_failed)
+            self._server.server_exited.connect(self._on_server_exited)
+        return self._server
+
+    def _on_run_clicked(self) -> None:
+        options = self._collect_options()
+        if options is None:
+            return
+        if self._script_path is None or self._perl_binary is None:
+            QMessageBox.critical(self, "Environment not ready", self.env_label.text())
+            return
+
+        # The server's collect endpoint expects the output dir question
+        # already settled (see RunOptions.to_collect_params: yes=True) —
+        # creating it here keeps that promise true instead of relying on
+        # a confirmation round-trip the protocol doesn't need for the GUI.
+        Path(options.output_dir).mkdir(parents=True, exist_ok=True)
+
+        self.log_view.clear()
+        self.tabs.setCurrentWidget(self.log_view)
+        self.run_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.open_output_button.setEnabled(False)
+        self.open_codequery_button.setEnabled(False)
+        self.statusBar().showMessage("Collecting…")
+
+        server = self._ensure_server()
+        self._current_options = options
+        self._collect_job_pid = None
+        self._render_request_id = None
+        self._collect_request_id = server.send("collect", options.to_collect_params())
+
+    def _on_stop_clicked(self) -> None:
+        # collect() runs in a forked child on the Perl side; job_started
+        # hands us that child's PID, so we can stop just the job instead
+        # of tearing down the whole persistent server process.
+        if self._collect_job_pid:
+            try:
+                os.kill(int(self._collect_job_pid), signal.SIGTERM)
+                self._append_log(
+                    f"[!] Sent stop signal to job (pid {self._collect_job_pid})."
+                )
+            except (ValueError, ProcessLookupError, PermissionError) as exc:
+                self._append_log(f"[!] Could not stop job: {exc}")
+        self._reset_run_controls()
+        self.statusBar().showMessage("Stopped.")
+
+    def _append_log(self, line: str) -> None:
+        self.log_view.appendPlainText(line)
+
+    def _reset_run_controls(self) -> None:
+        self.run_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
+    # --- server signal handlers ----------------------------------------
+    def _on_job_started(self, request_id: int, job_id: str) -> None:
+        if request_id == self._collect_request_id:
+            self._collect_job_pid = job_id
+
+    def _on_event_received(self, request_id: int, event: dict) -> None:
+        if request_id != self._collect_request_id:
+            return  # not this run (e.g. a leftover event after Stop)
+
+        level = event.get("level", "info")
+        if level == "tool_output":
+            # Mirrors emit_cli_event() in cpp_inspector.pl: caller_query
+            # tool_output comes from find_callers()'s internal cscope -L -3
+            # query, run once per symbol — that's raw source lines, not
+            # progress, and the CLI hides it too.
+            if event.get("context") == "caller_query":
+                return
+            for line in (event.get("data") or "").splitlines():
+                self._append_log(line)
+            return
+
+        step, total = event.get("step"), event.get("total")
+        message = event.get("message", "")
+        if step and total:
+            self._append_log(f"[{step}/{total}] {message}")
+        elif level in ("warning", "error"):
+            self._append_log(f"[!] {message}")
+        else:
+            self._append_log(message)
+
+    def _on_response_received(self, request_id: int, message: dict) -> None:
+        if request_id == self._collect_request_id:
+            self._handle_collect_response(message)
+        elif request_id == self._render_request_id:
+            self._handle_render_response(message)
+
+    def _handle_collect_response(self, message: dict) -> None:
+        if not message.get("ok"):
+            self._append_log(
+                f"[!] collect failed: {message.get('error', 'Unknown error')}"
+            )
+            self._reset_run_controls()
+            self.statusBar().showMessage("Failed.")
+            return
+
+        model = (message.get("data") or {}).get("model")
+        if model is None:
+            self._append_log("[!] collect succeeded but returned no model.")
+            self._reset_run_controls()
+            self.statusBar().showMessage("Failed.")
+            return
+
+        self.statusBar().showMessage("Rendering reports…")
+        server = self._ensure_server()
+        render_options = self._current_options.to_render_options()
+        self._render_request_id = server.send(
+            "render", {"model": model, "options": render_options}
+        )
+
+    def _handle_render_response(self, message: dict) -> None:
+        self._reset_run_controls()
+        if not message.get("ok"):
+            self._append_log(
+                f"[!] render failed: {message.get('error', 'Unknown error')}"
+            )
+            self.statusBar().showMessage("Failed.")
+            return
+
+        data = message.get("data") or {}
+        artifact_paths = data.get("artifact_paths") or {}
+        self.statusBar().showMessage("Done.")
+        self._load_reports(artifact_paths)
+        self.open_output_button.setEnabled(True)
+        db_path = artifact_paths.get("db")
+        self.open_codequery_button.setEnabled(bool(db_path) and Path(db_path).exists())
+
+    def _on_server_start_failed(self, message: str) -> None:
+        self._append_log(f"[!] Failed to start perl --serve: {message}")
+        self._reset_run_controls()
+        self.statusBar().showMessage("Failed to start.")
+
+    def _on_server_exited(self, exit_code: int, status: str) -> None:
+        self._append_log(f"[!] Server process {status} (exit code {exit_code}).")
+        self._server = None
+        self._reset_run_controls()
+        self.statusBar().showMessage("Server stopped.")
+
+    # ------------------------------------------------------------------
+    # Report loading
+    # ------------------------------------------------------------------
+    def _load_reports(self, artifact_paths: dict) -> None:
+        """artifact_paths comes straight from the render() response — the
+        actual paths the script just wrote — so there's no filename
+        guessing to keep in sync with report_filename() on the Perl side."""
+        widget_for_key = {
+            "text": "txt",
+            "csv": "csv",
+            "json": "json",
+            "svg": "svg",
+        }
+        for key, widget_name in widget_for_key.items():
+            raw_path = artifact_paths.get(key)
+            if raw_path and Path(raw_path).exists():
+                self.report_widgets[widget_name].load(Path(raw_path))
+
+        self.tabs.setCurrentWidget(self.report_widgets["txt"])
+
     def _collect_options(self) -> RunOptions | None:
         project_dir = self.project_edit.text().strip()
         output_dir = self.output_edit.text().strip() or str(
             Path(project_dir) / "output"
         )
-        config_dir = self.config_dir_edit.text().strip()
 
         if not project_dir:
             QMessageBox.warning(
                 self, "Missing project", "Please choose a project directory first."
             )
             return None
-
         if not Path(project_dir).is_dir():
             QMessageBox.warning(
                 self, "Invalid project", f"'{project_dir}' is not a directory."
             )
             return None
-
-        if config_dir and not Path(config_dir).is_dir():
-            QMessageBox.warning(
-                self,
-                "Invalid Config directory",
-                f"Failed to use '{config_dir}'. Ignoring config.json.",
-            )
-            config_dir = ""
 
         kinds = "".join(
             letter for letter, cb in self.kind_checks.items() if cb.isChecked()
@@ -301,167 +493,32 @@ class MainWindow(QMainWindow):
         return RunOptions(
             project_dir=project_dir,
             output_dir=output_dir,
-            config_dir=config_dir,
             kinds=kinds,
             no_label=self.no_label_check.isChecked(),
             no_line=self.no_line_check.isChecked(),
             no_call=self.no_call_check.isChecked(),
+            config_dir=self.config_dir_edit.text().strip(),
             ignore_config=self.ignore_config_check.isChecked(),
         )
-
-    def _on_run_clicked(self) -> None:
-        options = self._collect_options()
-        if options is None:
-            return
-        if self._script_path is None or self._perl_binary is None:
-            QMessageBox.critical(self, "Environment not ready", self.env_label.text())
-            return
-
-        Path(options.output_dir).mkdir(parents=True, exist_ok=True)
-
-        self.log_view.clear()
-        self.tabs.setCurrentWidget(self.log_view)
-        self.run_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.open_output_button.setEnabled(False)
-        self.open_codequery_button.setEnabled(False)
-        self.statusBar().showMessage("Running cpp_inspector.pl …")
-
-        self._runner = InspectorRunner(self._perl_binary, self._script_path, self)
-        self._runner.output_received.connect(self._append_log)
-        self._runner.finished.connect(
-            lambda code, status: self._on_run_finished(code, status, options)
-        )
-        self._runner.failed_to_start.connect(self._on_run_failed)
-        self._runner.start(options)
-
-    def _on_stop_clicked(self) -> None:
-        if self._runner is not None:
-            self._runner.stop()
-        self.statusBar().showMessage("Stopped.")
-
-    def _append_log(self, line: str) -> None:
-        self.log_view.appendPlainText(line)
-
-    def _on_run_failed(self, message: str) -> None:
-        self._append_log(f"[!] Failed to start perl: {message}")
-        self._reset_run_controls()
-        self.statusBar().showMessage("Failed to start.")
-
-    def _on_run_finished(
-        self, exit_code: int, status: str, options: RunOptions
-    ) -> None:
-        self._reset_run_controls()
-        if exit_code == 0 and status == "exited":
-            self.statusBar().showMessage("Done.")
-            self._load_reports(options)
-            self.open_output_button.setEnabled(True)
-            self.open_codequery_button.setEnabled(
-                Path(options.output_dir, "codequery.db").exists()
-            )
-        else:
-            self.statusBar().showMessage(
-                f"cpp_inspector.pl {status} with exit code {exit_code}."
-            )
-
-    def _reset_run_controls(self) -> None:
-        self.run_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-
-    # ------------------------------------------------------------------
-    # Report loading
-    # ------------------------------------------------------------------
-    def _load_reports(self, options: RunOptions) -> None:
-        out_dir = Path(options.output_dir)
-
-        txt_path = self._resolve_report_path(out_dir, options, "txt")
-        json_path = self._resolve_report_path(out_dir, options, "json")
-        csv_path = out_dir / "cpp_relationships.csv"
-        svg_path = out_dir / "cpp_call_graph.svg"
-
-        if txt_path is not None:
-            self.report_widgets["txt"].load(txt_path)
-        else:
-            self._append_log(
-                "[!] No cpp_relationships*.txt found in the output directory — "
-                "nothing to show in the Text report tab."
-            )
-        if csv_path.exists():
-            self.report_widgets["csv"].load(csv_path)
-        if json_path is not None:
-            self.report_widgets["json"].load(json_path)
-        else:
-            self._append_log(
-                "[!] No cpp_relationships*.json found in the output directory — "
-                "nothing to show in the JSON tab."
-            )
-        if svg_path.exists():
-            self.report_widgets["svg"].load(svg_path)
-
-        self.tabs.setCurrentWidget(self.report_widgets["txt"])
-
-    def _resolve_report_path(
-        self, out_dir: Path, options: RunOptions, extension: str
-    ) -> Path | None:
-        """Finds the report file cpp_inspector.pl just wrote.
-
-        Tries the exact name first (mirroring report_filename() in the
-        Perl script). If that's missing — e.g. the project's own
-        config.json (read relative to wherever the perl process's cwd
-        is, not --in) silently overrode a flag the GUI thinks is off —
-        falls back to the most recently modified cpp_relationships*.<ext>
-        in the output directory, rather than leaving the tab blank with
-        no explanation.
-        """
-        expected = out_dir / self._report_filename(options, extension)
-        if expected.exists():
-            return expected
-
-        candidates = sorted(
-            out_dir.glob(f"cpp_relationships*.{extension}"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            self._append_log(
-                f"[!] Expected '{expected.name}' but found '{candidates[0].name}' instead "
-                "(likely due to a project config.json overriding a flag) — showing that one."
-            )
-            return candidates[0]
-        return None
-
-    @staticmethod
-    def _report_filename(options: RunOptions, extension: str) -> str:
-        """Mirrors report_filename() in cpp_inspector.pl so the GUI finds
-        the exact same file the script just wrote."""
-        suffix = []
-        if options.kinds != "fpmc":
-            suffix.append("kind_" + options.kinds)
-        if options.no_label:
-            suffix.append("no_label")
-        if options.no_line:
-            suffix.append("no_line")
-        if options.no_call:
-            suffix.append("no_call")
-
-        name = "cpp_relationships"
-        if suffix:
-            name += "__" + "__".join(suffix)
-        return f"{name}.{extension}"
 
     # ------------------------------------------------------------------
     # Misc actions
     # ------------------------------------------------------------------
+    def _on_load_config_clicked(self) -> None:
+        config_dir = self.config_dir_edit.text().strip()
+        config_path = Path(config_dir) / "config.json" if config_dir else None
+        if not config_dir or not config_path.is_file():
+            QMessageBox.information(
+                self, "No config.json", f"No config.json found in '{config_dir}'."
+            )
+            return
+        self._maybe_autoload_config(config_dir)
+
     def _on_save_config_clicked(self) -> None:
         options = self._collect_options()
         if options is None:
             return
-
-        config_dir = self.config_dir_edit.text().strip()
-        if not Path(config_dir).is_dir():
-            config_dir = options.project_dir
-
-        config_path = Path(config_dir) / "config.json"
+        config_path = Path(options.project_dir) / "config.json"
         payload = {
             "out": options.output_dir,
             "kind": options.kinds,
