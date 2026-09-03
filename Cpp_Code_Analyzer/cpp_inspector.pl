@@ -16,16 +16,29 @@ use strict;
 use warnings;
 use feature 'say';
 
+# Get pathname of current working directory
 use Cwd qw(abs_path);
 
+# Supply object methods for filehandles
 use File::Basename qw(basename dirname);
 use File::Find     qw(find);
 use File::Path     qw(make_path);
 use File::Spec;
 
+# Extended processing of command line options
 use Getopt::Long qw(GetOptions);
 
+# Open a process for reading, writing, and error handling using open3()
+use IPC::Open3;
+
+# OO interface to the select system call
+use IO::Select;
+
+#JSON::XS compatible pure-Perl module.
 use JSON::PP qw(encode_json);
+
+# Manipulate Perl symbols and their names
+use Symbol qw(gensym);
 
 use constant {
     SOURCE_EXT_RE  => qr/\.(?:c|cpp|cxx|cc|h|hpp|hxx|hh)$/i,
@@ -35,22 +48,23 @@ use constant {
 
 # Kinds we care about when scanning ctags output:
 # f=function, c=class, p=prototype, m=member.
-# Sort priority controls the order in which they appear in the report.
 my %KIND_LABEL = (
     f => 'Function',
     p => 'Prototype',
     m => 'Member',
     c => 'Class',
 );
+
+# Sort priority controls the order in which they appear in the report.
 my %KIND_PRIORITY = ( f => 1, p => 2, m => 3, c => 4 );
 
 # Canonical order for --kind selections, LEGEND, and SUMMARY output.
 my @ALL_KINDS = qw(f p m c);
 
-main();
-exit 0;
-
 # ----------------------------------------------------------------------
+# CLI - Entrypoint
+# ----------------------------------------------------------------------
+
 sub usage {
     return <<"HELP";
 Usage:
@@ -68,257 +82,486 @@ Options:
   --no_call        Hide the "Called by:" section in cpp_relationships.txt
   --ignore_config  Ignore config.json even if it is present
   --yes, -y        Skip the confirmation prompt when --out doesn't exist yet
-                      (creates it automatically - useful for scripts/CI)
+  --serve          Run the dependency-free JSON-lines API server
   --help, -h       Display this help message and exit
 
-Note:
-  The text report filename gets a suffix for each active flag above, e.g.:
-    cpp_relationships.txt
-    cpp_relationships__kind_fp.txt
-    cpp_relationships__kind_fp__no_label__no_call.txt
+Without --serve, the script preserves the interactive CLI behavior.
+With --serve, requests are read as JSON objects and responses/events are
+written as JSON objects; no confirmation prompt is ever issued.
 
-  If a "config.json" file exists at the root of --in, its values
-  (out/kind/no_line/no_label/no_call/yes) are used as defaults. Explicit
-  CLI flags always take precedence over the config file. Example:
-    { "kind": "fp", "no_line": true }
-
-Examples:
-  perl $0 --in=/path/to/cpp/project --out=/path/to/output_folder --config=/path/to/cpp/project
-  perl $0 --in=./my_project --kind=fp --no_line --ignore_config
-  perl $0 --in=./my_project --out=./ci_output --yes   # non-interactive (CI)
+Server request examples:
+  {"id":1,"endpoint":"resolve_paths","params":{"in":"./project","out":"./output"}}
+  {"id":2,"endpoint":"load_config","params":{"config_dir":"./project"}}
+  {"id":3,"endpoint":"collect","params":{"in":"./project","out":"./output","yes":true}}
+  {"id":4,"endpoint":"render","params":{"model":{...},"options":{"kind":"fp"} }}
 HELP
 }
 
 sub main {
     refuse_to_run_as_root();
 
-    require_tools_or_die(qw(ctags cscope cqmakedb));
-
     my $opts = parse_arguments(@ARGV);
-    die usage() if ( $opts->{in} eq "" );
-
-    my $project_dir = resolve_project_dir( $opts->{in} );
-
-    # Path to the directory containing config.json
-    my $config_dir = "";
-    unless ( $opts->{ignore_config} ) {
-        $config_dir =
-          length( $opts->{config_dir} ) ? $opts->{config_dir} : $project_dir;
-
-        # Load, verify, and apply custom configuration
-        my $config = load_project_config($config_dir);
-        if (%$config) {
-            apply_config_defaults( $opts, $config );
-        }
-        else {
-            $opts->{ignore_config} = 1;
-        }
+    if ( $opts->{serve} ) {
+        return run_server();
     }
+
+    require_tools_or_die(qw(ctags cscope cqmakedb));
+    die usage() if $opts->{in} eq '';
+
+    my $paths = resolve_paths($opts);
+
+    unless ( $opts->{ignore_config} ) {
+        my $config = load_config( $paths->{config_dir} );
+        emit_cli_events(
+            [ make_event( 'info', "Loaded project config: $config->{path}" ) ] )
+          if $config->{path};
+        emit_cli_events(
+            [ map { make_event( 'warning', $_ ) } @{ $config->{warnings} } ] );
+        apply_config_defaults( $opts, $config->{values} )
+          if %{ $config->{values} };
+    }
+
+    $paths = resolve_paths($opts);
+    $opts->{yes} ||= 0;
+
+    create_output_dir_if_needed( $paths, $opts->{yes}, 1 );
 
     my $kind_filter =
       normalize_kind_selection( $opts->{kind} // join( '', @ALL_KINDS ) );
 
-    my $output_dir =
-      resolve_output_dir( $opts->{out} // DEFAULT_OUTDIR, $opts->{yes} );
-
-    say "[*] Scanning project directory: $project_dir";
-    say "[*] Saving output artifacts to: $output_dir";
-    say "[*] Current Config directory: $config_dir" unless ( $opts->{ignore_config} );
-
+    say "[*] Scanning project directory: $paths->{project_dir}";
+    say "[*] Saving output artifacts to: $paths->{output_dir}";
+    say "[*] Current Config directory: $paths->{config_dir}"
+      unless $opts->{ignore_config};
     say "[*] Current commands: "
-      . ( $opts->{no_label}      ? " --no_label"                   : "" )
-      . ( $opts->{no_line}       ? " --no_line"                    : "" )
-      . ( $opts->{no_call}       ? " --no_call"                    : "" )
-      . ( $opts->{ignore_config} ? " --ignore_config"              : "" )
-      . ( $kind_filter ? " --kinds=" . join( "", @{$kind_filter} ) : "" )
-      . ( $opts->{yes} ? " --yes" : "" ) . "\n";
+      . ( $opts->{no_label}      ? " --no_label"                 : "" )
+      . ( $opts->{no_line}       ? " --no_line"                  : "" )
+      . ( $opts->{no_call}       ? " --no_call"                  : "" )
+      . ( $opts->{ignore_config} ? " --ignore_config"            : "" )
+      . ( $kind_filter ? " --kinds=" . join( '', @$kind_filter ) : "" )
+      . ( $opts->{yes} ? " --yes"                                : "" ) . "\n";
 
-    my @source_files = collect_source_files($project_dir);
-    my $total_files  = scalar @source_files;
-    say "[1/8] Found $total_files C/C++ source/header files.";
-    die "No C/C++ files found in '$project_dir'.\n" unless $total_files;
+    $opts->{paths} = $paths;
+    $opts->{emit}  = \&emit_cli_event;
 
-    my $cscope_files_path = File::Spec->catfile( $output_dir, 'cscope.files' );
-    write_file_list( $cscope_files_path, \@source_files );
-    say "[2/8] Wrote absolute file list to 'cscope.files'.";
+    my $collected = collect($opts);
 
-    my $tags_path       = File::Spec->catfile( $output_dir, 'tags' );
-    my $cscope_out_path = File::Spec->catfile( $output_dir, 'cscope.out' );
-    my $db_path         = File::Spec->catfile( $output_dir, 'codequery.db' );
-    my $report_path =
-      File::Spec->catfile( $output_dir,
-        report_filename( $opts, $kind_filter, 'txt' ) );
-    my $csv_path = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
-    my $json_path =
-      File::Spec->catfile( $output_dir,
-        report_filename( $opts, $kind_filter, 'json' ) );
-    my $svg_path = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
-
-    say "[3/8] Running ctags...";
-    run_ctags( $cscope_files_path, $tags_path );
-
-    say "[4/8] Running cscope...";
-    run_cscope( $cscope_files_path, $cscope_out_path );
-
-    say "[5/8] Generating CodeQuery database (.db)...";
-    run_cqmakedb( $db_path, $cscope_out_path, $tags_path );
-
-    say "[6/8] Parsing tags output...";
-    my %definitions = parse_tags($tags_path);
-
-    say "[7/8] Mapping caller/callee relationships via cscope...";
-    my %callers_of = build_caller_map( \%definitions, $cscope_out_path );
-
-    say "[8/8] Writing text, CSV, JSON and SVG reports...";
-    my $format = {
-        hide_labels    => $opts->{no_label},
-        hide_lines     => $opts->{no_line},
-        hide_called_by => $opts->{no_call},
-        kind           => $kind_filter,
-    };
-    write_text_report( $report_path, \%definitions, \%callers_of,
-        $project_dir, $format );
-    write_csv_report( $csv_path, \%callers_of, $project_dir );
-    write_json_report( $json_path, \%definitions, \%callers_of, $project_dir,
-        $format );
-    write_svg_call_graph( $svg_path, \%callers_of );
-
-    print_summary( $db_path, $report_path, $csv_path, $json_path, $svg_path );
+    my $rendered = render( $collected->{model}, $opts );
+    print_summary(
+        $rendered->{artifact_paths}{db},  $rendered->{artifact_paths}{text},
+        $rendered->{artifact_paths}{csv}, $rendered->{artifact_paths}{json},
+        $rendered->{artifact_paths}{svg}
+    );
     return;
 }
 
-# ----------------------------------------------------------------------
-# Setup / validation helpers
-# ----------------------------------------------------------------------
-
 sub refuse_to_run_as_root {
     return unless $> == 0;
-    die
-"Error: Running this script as 'root' is not allowed for security reasons.\n"
+    die "Error: Running this script as 'root'"
+      . " is not allowed for security reasons.\n"
       . "Please run it as a normal user.\n";
 }
 
-sub parse_arguments {
-    local @ARGV = @_;
+# ----------------------------------------------------------------------
+# Dependency-free JSON-lines server
+# ----------------------------------------------------------------------
 
-    my %opts = (
-        in            => "",
-        out           => undef,
-        config_dir    => "",
-        no_line       => 0,
-        no_label      => 0,
-        no_call       => 0,
-        ignore_config => 0,
-        kind          => undef,
-        yes           => 0,
-    );
-    GetOptions(
-        'in=s'          => \$opts{in},
-        'out=s'         => \$opts{out},
-        'config=s'      => \$opts{config_dir},
-        'no_line'       => \$opts{no_line},
-        'no_label'      => \$opts{no_label},
-        'no_call'       => \$opts{no_call},
-        'ignore_config' => \$opts{ignore_config},
-        'kind=s'        => \$opts{kind},
-        'yes|y'         => \$opts{yes},
-        'help|h'        => sub { print usage(); exit 0; },
-    ) or die usage();
-
-    return \%opts;
-}
-
-# Validates the --kind value (a string of any combination of f/p/m/c) and
-# returns an arrayref of the selected kinds in canonical order (f p m c),
-# regardless of the order/repetition the user typed them in. Dies with a
-# clear message on invalid or empty input.
-sub normalize_kind_selection {
-    my ($raw) = @_;
-
-    my %requested = map  { $_ => 1 } split //, lc( $raw // '' );
-    my @invalid   = grep { !exists $KIND_LABEL{$_} } keys %requested;
-
-    die "Error: invalid --kind value(s): "
-      . join( ', ', sort @invalid )
-      . ". Valid kinds are: "
-      . join( ' ', @ALL_KINDS ) . ".\n"
-      if @invalid;
-    die "Error: --kind must include at least one of: "
-      . join( ' ', @ALL_KINDS ) . ".\n"
-      unless %requested;
-
-    return [ grep { $requested{$_} } @ALL_KINDS ];
-}
-
-# It looks for a path to "config.json"; if it exists, it loads
-# it as a source of default values ​​for the options
-# (out/kind/no_line/no_label/no_call/yes).
-# This allows the project to define its own preferred flags
-# without needing to repeat them on every invocation.
-# It returns {} when no configuration file exists.
+# The server protocol is deliberately small so the script remains a single
+# file with no web framework dependency:
 #
-# Example config.json:
-#   {
-#     "out": "output_codequery",
-#     "kind": "fp",
-#     "no_line": false,
-#     "no_label": false,
-#     "no_call": false,
-#     "yes": false
-#   }
-sub load_project_config {
-    my ($config_dir) = @_;
-    return {} unless -d $config_dir;
+# Request:
+#   {"id": 1, "endpoint": "resolve_paths", "params": {...}}
+#
+# Response:
+#   {"id": 1, "type": "response", "ok": true, "data": {...}}
+#
+# Event:
+#   {"id": 1, "type": "event", ...}
+#
+# Errors use the same envelope with ok=false. STDIN is a request transport,
+# NEVER an interactive confirmation channel.
+sub server_write {
+    my ($value) = @_;
+    print encode_json($value), "\n";
+}
 
-    # Path to the configuration file
-    my $config_path = File::Spec->catfile( $config_dir, "config.json" );
-    return {} unless -f $config_path;
+sub run_server {
+    while ( my $line = <STDIN> ) {
+        chomp $line;
+        next unless length $line;
+
+        my $request = eval { JSON::PP->new->decode($line) };
+        if ( $@ || ref($request) ne 'HASH' ) {
+            server_write(
+                {
+                    type  => 'response',
+                    ok    => JSON::PP::false,
+                    error => 'Invalid JSON request.',
+                }
+            );
+            next;
+        }
+
+        my $id       = $request->{id};
+        my $endpoint = $request->{endpoint} // '';
+        my $params   = $request->{params};
+        $params = {} unless ref($params) eq 'HASH';
+
+        if ( $endpoint eq 'collect' ) {
+            run_server_collect_job( $id, $params );
+            next;
+        }
+
+        my $result = eval {
+            if ( $endpoint eq 'resolve_paths' ) {
+                return resolve_paths($params);
+            }
+            if ( $endpoint eq 'load_config' ) {
+                my $config_dir = $params->{config_dir} // '';
+                return load_config($config_dir);
+            }
+            if ( $endpoint eq 'render' ) {
+                my $model   = $params->{model};
+                my $options = $params->{options} // {};
+                return render( $model, $options );
+            }
+            die "Unknown endpoint '$endpoint'.\n";
+        };
+
+        if ($@) {
+            server_write(
+                {
+                    id    => $id,
+                    type  => 'response',
+                    ok    => JSON::PP::false,
+                    error => "$@",
+                }
+            );
+            next;
+        }
+
+        server_write(
+            {
+                id   => $id,
+                type => 'response',
+                ok   => JSON::PP::true,
+                data => $result,
+            }
+        );
+    }
+}
+
+sub run_server_collect_job {
+    my ( $id, $params ) = @_;
+
+    my ( $reader, $writer );
+    pipe( $reader, $writer )
+      or die "Error: cannot create collect job pipe: $!\n";
+
+    my $pid = fork();
+    die "Error: cannot fork collect job: $!\n" unless defined $pid;
+
+    if ( $pid == 0 ) {
+        close $reader;
+        select( ( select($writer), $| = 1 )[0] );
+
+        my $payload;
+        my $ok = eval {
+            require_tools_or_die(qw(ctags cscope cqmakedb));
+
+            my $paths = resolve_paths($params);
+            if ( $paths->{needs_output_creation} ) {
+                die "Confirmation required: "
+                  . "output directory '$paths->{output_dir}' "
+                  . "does not exist. Call again with yes=true.\n"
+                  unless $params->{yes};
+                make_path( $paths->{output_dir} );
+                $paths->{output_dir} = abs_path( $paths->{output_dir} );
+            }
+            $params->{paths} = $paths;
+
+            $params->{emit} = sub {
+                my ($event) = @_;
+                print {$writer} encode_json( { %$event, id => $id } ), "\n";
+            };
+
+            $payload = collect($params);
+            1;
+        };
+
+        if ($ok) {
+            delete $payload->{events};
+            print {$writer} encode_json(
+                {
+                    id   => $id,
+                    type => 'response',
+                    ok   => JSON::PP::true,
+                    data => $payload,
+                }
+              ),
+              "\n";
+        }
+        else {
+            print {$writer} encode_json(
+                {
+                    id    => $id,
+                    type  => 'response',
+                    ok    => JSON::PP::false,
+                    error => "$@",
+                }
+              ),
+              "\n";
+        }
+
+        close $writer;
+        exit( $ok ? 0 : 1 );
+    }
+
+    close $writer;
+    server_write(
+        {
+            id       => $id,
+            type     => 'job_started',
+            ok       => JSON::PP::true,
+            job_id   => "$pid",
+            endpoint => 'collect',
+        }
+    );
+
+    while ( my $event_line = <$reader> ) {
+        chomp $event_line;
+        my $event = eval { JSON::PP->new->decode($event_line) };
+        if ( $@ || ref($event) ne 'HASH' ) {
+            server_write(
+                {
+                    id    => $id,
+                    type  => 'response',
+                    ok    => JSON::PP::false,
+                    error => 'Invalid internal collect event.',
+                }
+            );
+            next;
+        }
+        server_write($event);
+    }
+
+    close $reader;
+    waitpid( $pid, 0 );
+}
+
+sub emit_server_collect_events {
+    my ( $id, $events ) = @_;
+    for my $event (@$events) {
+        server_write( { %$event, id => $id } );
+    }
+}
+
+# ----------------------------------------------------------------------
+# Common Event Shape
+# ----------------------------------------------------------------------
+
+# A single structured event shape is used by every frontend:
+#   { type => "event", step => N, total => N, message => "...",
+#     level => "info|warning|error|tool_output", ... }
+#
+# Core functions never print progress. They return events; the frontend owns
+# the transport (terminal, TUI, HTTP adapter, etc.).
+sub make_event {
+    my ( $level, $message, %extra ) = @_;
+    return {
+        type    => 'event',
+        level   => $level,
+        message => $message,
+        %extra,
+    };
+}
+
+sub emit_cli_event {
+    my ($event) = @_;
+    return unless ref($event) eq 'HASH';
+
+    my $level = $event->{level} // 'info';
+    if ( $level eq 'tool_output' ) {
+        return if ( $event->{context} // '' ) eq 'caller_query';
+
+        my $stream = $event->{stream} // 'stdout';
+        my $data   = $event->{data}   // '';
+        return unless length $data;
+
+        if ( $stream eq 'stderr' ) {
+            print STDERR $data;
+        }
+        else {
+            print $data;
+        }
+        return;
+    }
+
+    my $step  = $event->{step};
+    my $total = $event->{total};
+    if ( defined $step && defined $total ) {
+        say sprintf( '[%d/%d] %s', $step, $total, $event->{message} // '' );
+    }
+    elsif ( $level eq 'warning' ) {
+        warn( $event->{message} // '' ) . "\n";
+    }
+    elsif ( $level eq 'error' ) {
+        warn( $event->{message} // '' ) . "\n";
+    }
+    else {
+        say $event->{message} // '';
+    }
+}
+
+sub emit_cli_events {
+    my ($events) = @_;
+    emit_cli_event($_) for @$events;
+}
+
+# ----------------------------------------------------------------------
+# Frontend - API
+# ----------------------------------------------------------------------
+
+# Resolves project/output/config paths without creating directories or asking
+# questions. The caller decides whether a pending confirmation is acceptable.
+sub resolve_paths {
+    my ($params) = @_;
+    $params //= {};
+
+    my $raw_project = $params->{in} // '';
+    die "Error: project path is required.\n" unless length $raw_project;
+    $raw_project = glob($raw_project) if $raw_project =~ /^~/;
+
+    my $project_dir = abs_path($raw_project)
+      or die "Error: Invalid project directory path: $raw_project\n";
+    die "Error: The project directory '$project_dir' does not exist.\n"
+      unless -d $project_dir;
+
+    my $raw_output = defined $params->{out} ? $params->{out} : DEFAULT_OUTDIR;
+    $raw_output = glob($raw_output) if $raw_output =~ /^~/;
+    my $output_abs    = File::Spec->rel2abs($raw_output);
+    my $output_exists = -d $raw_output ? 1 : 0;
+
+    my $config_dir = '';
+    unless ( $params->{ignore_config} ) {
+        $config_dir =
+          length( $params->{config_dir} // '' )
+          ? $params->{config_dir}
+          : $project_dir;
+        $config_dir = glob($config_dir) if $config_dir =~ /^~/;
+        $config_dir = abs_path($config_dir) // $config_dir;
+    }
+
+    return {
+        project_dir   => $project_dir,
+        output_dir    => $output_exists ? abs_path($raw_output) : $output_abs,
+        config_dir    => $config_dir,
+        output_exists => $output_exists,
+        needs_output_creation => $output_exists ? 0 : 1,
+        confirmation          => $output_exists
+        ? undef
+        : {
+            required => 1,
+            action   => 'create_output_dir',
+            path     => $output_abs,
+        },
+    };
+}
+
+# Pure config reader: no printing, warnings, prompting, or other UI effects.
+# Returns { values => {...}, warnings => [...] }.
+sub load_config {
+    my ($config_dir) = @_;
+    return { values => {}, warnings => [] }
+      unless defined $config_dir && -d $config_dir;
+
+    my $config_path = File::Spec->catfile( $config_dir, 'config.json' );
+    return { values => {}, warnings => [] } unless -f $config_path;
 
     open my $fh, '<', $config_path
-      or die "[-] Cannot open $config_path: $!\n";
+      or die "Cannot open $config_path: $!\n";
     local $/;
     my $raw = <$fh>;
-    close $fh;
+    close $fh or die "Cannot close $config_path: $!\n";
 
     my $data = eval { JSON::PP->new->decode($raw) };
     die "Error: invalid JSON in $config_path: $@\n" if $@;
     die "Error: $config_path must contain a JSON object.\n"
       unless ref($data) eq 'HASH';
 
-    my %known_keys =
-      map { $_ => 1 } qw(out kind no_line no_label no_call yes);
-    my %config;
-    for my $key ( keys %$data ) {
-        unless ( $known_keys{$key} ) {
-            warn "Warning: unknown key '$key' in $config_path (ignored).\n";
+    my %known = map { $_ => 1 } qw(out kind no_line no_label no_call yes);
+    my %values;
+    my @warnings;
+    for my $key ( sort keys %$data ) {
+        if ( !$known{$key} ) {
+            push @warnings,
+              "Warning: unknown key '$key' in $config_path (ignored).";
             next;
         }
-        $config{$key} = $data->{$key};
+        $values{$key} = $data->{$key};
     }
 
-    say "[*] Loaded project config: $config_path";
-    return \%config;
+    return {
+        values   => \%values,
+        warnings => \@warnings,
+        path     => $config_path,
+    };
 }
 
-# Fills in $opts values left unset on the CLI (out/kind are undef, the
-# hide_*/yes booleans are still 0) from the loaded config. Precedence is
-# CLI > config > built-in default.
+sub load_project_config {
+    my ($config_dir) = @_;
+    return load_config($config_dir)->{values};
+}
+
 sub apply_config_defaults {
     my ( $opts, $config ) = @_;
-    return unless %$config;
+    return unless ref($config) eq 'HASH' && %$config;
 
     for my $bool_key (qw(no_line no_label no_call yes)) {
-        next if $opts->{$bool_key};    # explicit CLI flag always wins
+        next if $opts->{$bool_key};
         next unless exists $config->{$bool_key};
         $opts->{$bool_key} = $config->{$bool_key} ? 1 : 0;
     }
-
     $opts->{out} = $config->{out}
       if !defined $opts->{out} && defined $config->{out};
     $opts->{kind} = $config->{kind}
       if !defined $opts->{kind} && defined $config->{kind};
+}
 
+sub confirm_or_die {
+    my ( $prompt, $decision ) = @_;
+
+    return if defined $decision && $decision;
+
+    print $prompt;
+    my $answer = <STDIN>;
+    $answer = defined $answer ? lc($answer) : 'n';
+    chomp $answer;
+
+    die "Aborted: output directory was not created.\n"
+      unless $answer =~ /^y(es)?$/;
     return;
+}
+
+sub create_output_dir_if_needed {
+    my ( $paths, $decision, $interactive ) = @_;
+    return $paths->{output_dir} unless $paths->{needs_output_creation};
+
+    if ($interactive) {
+        confirm_or_die(
+            "[?] Output directory does not exist: $paths->{output_dir}\n"
+              . "    Create it now? [y/N] ",
+            $decision
+        );
+    }
+    else {
+        die "Error: output directory '$paths->{output_dir}' does not exist "
+          . "and no confirmation decision was supplied.\n"
+          unless defined $decision && $decision;
+    }
+
+    make_path( $paths->{output_dir} );
+    return abs_path( $paths->{output_dir} );
 }
 
 sub find_tool_in_path {
@@ -333,87 +576,63 @@ sub find_tool_in_path {
 sub require_tools_or_die {
     my @tools   = @_;
     my @missing = grep { !find_tool_in_path($_) } @tools;
-
     return unless @missing;
     die "Error: The following required tool(s) are missing from your PATH: "
       . join( ', ', @missing )
-      . ".\nPlease install them before running this script.\n";
+      . ".\nPlease install them before running the script.\n";
 }
 
-sub resolve_project_dir {
-    my ($raw_path) = @_;
-    $raw_path = glob($raw_path) if defined $raw_path && $raw_path =~ /^~/;
-    my $abs = abs_path($raw_path)
-      or die "Error: Invalid project directory path: $raw_path\n";
-    die "Error: The project directory '$abs' does not exist.\n"
-      . "Use --help for usage information.\n"
-      unless -d $abs;
-    return $abs;
+sub parse_arguments {
+    local @ARGV = @_;
+    my %opts = (
+        in            => '',
+        out           => undef,
+        config_dir    => '',
+        no_line       => 0,
+        no_label      => 0,
+        no_call       => 0,
+        ignore_config => 0,
+        kind          => undef,
+        yes           => 0,
+        serve         => 0,
+    );
+    GetOptions(
+        'in=s'          => \$opts{in},
+        'out=s'         => \$opts{out},
+        'config=s'      => \$opts{config_dir},
+        'no_line'       => \$opts{no_line},
+        'no_label'      => \$opts{no_label},
+        'no_call'       => \$opts{no_call},
+        'ignore_config' => \$opts{ignore_config},
+        'kind=s'        => \$opts{kind},
+        'yes|y'         => \$opts{yes},
+        'serve'         => \$opts{serve},
+        'help|h'        => sub { print usage(); exit 0; },
+    ) or die usage();
+    return \%opts;
 }
 
-sub resolve_output_dir {
-    my ( $raw_path, $auto_yes ) = @_;
-    $raw_path = glob($raw_path) if defined $raw_path && $raw_path =~ /^~/;
-
-    unless ( -d $raw_path ) {
-
-        my $would_be_path = File::Spec->rel2abs($raw_path);
-        confirm_or_die(
-            "[?] Output directory does not exist: $would_be_path\n"
-              . "    Create it now? [y/N] ",
-            $auto_yes
-        );
-        make_path($raw_path);
-    }
-
-    return abs_path($raw_path);
-}
-
-sub confirm_or_die {
-    my ( $prompt, $auto_yes ) = @_;
-    return if $auto_yes;
-
-    print $prompt;
-    my $answer = <STDIN>;
-    $answer = defined $answer ? lc($answer) : 'n';
-    chomp $answer;
-
-    die "Aborted: output directory was not created.\n"
-      unless $answer =~ /^y(es)?$/;
-    return;
-}
-
-# Builds a report filename, appending a suffix for each active formatting
-# flag (in a fixed order) so runs with different flags don't overwrite
-# each other's report in the same output directory. Used for both the
-# text and JSON reports, since both honor the same hide_*/kind flags. E.g.:
-#   cpp_relationships.txt / .json
-#   cpp_relationships__kind_fp.txt / .json
-#   cpp_relationships__kind_fp__no_label__no_call.txt / .json
-sub report_filename {
-    my ( $opts, $kind_filter, $extension ) = @_;
-
-    my @suffix;
-    push @suffix, 'kind_' . join( '', @$kind_filter )
-      if @$kind_filter != @ALL_KINDS;
-    push @suffix, 'no_label' if $opts->{no_label};
-    push @suffix, 'no_line'  if $opts->{no_line};
-    push @suffix, 'no_call'  if $opts->{no_call};
-
-    my $name = 'cpp_relationships';
-    $name .= '__' . join( '__', @suffix ) if @suffix;
-    return "$name.$extension";
+sub normalize_kind_selection {
+    my ($raw)     = @_;
+    my %requested = map  { $_ => 1 } split //, lc( $raw // '' );
+    my @invalid   = grep { !exists $KIND_LABEL{$_} } keys %requested;
+    die "Error: invalid --kind value(s): "
+      . join( ', ', sort @invalid )
+      . ". Valid kinds are: "
+      . join( ' ', @ALL_KINDS ) . ".\n"
+      if @invalid;
+    die "Error: --kind must include at least one of: "
+      . join( ' ', @ALL_KINDS ) . ".\n"
+      unless %requested;
+    return [ grep { $requested{$_} } @ALL_KINDS ];
 }
 
 # ----------------------------------------------------------------------
-# File collection
+# Collection and Rendering
 # ----------------------------------------------------------------------
 
-# Recursively collects C/C++ source and header files, skipping common
-# non-source directories (VCS metadata, build output, etc.).
 sub collect_source_files {
     my ($project_dir) = @_;
-
     my @source_files;
     find(
         {
@@ -432,7 +651,6 @@ sub collect_source_files {
         },
         $project_dir
     );
-
     return sort @source_files;
 }
 
@@ -441,39 +659,283 @@ sub write_file_list {
     open my $fh, '>', $path or die "Could not create $path: $!\n";
     print {$fh} "$_\n" for @$files;
     close $fh or die "Could not write $path: $!\n";
-    return;
 }
 
-# ----------------------------------------------------------------------
-# External tool invocations
-# ----------------------------------------------------------------------
+sub run_tool_capture {
+    my ( $tool, @args ) = @_;
+
+    my $stderr_fh = gensym();
+    my ( $stdin_fh, $stdout_fh );
+    my $pid = eval { open3( $stdin_fh, $stdout_fh, $stderr_fh, $tool, @args ) };
+    die "Error: failed to start $tool: $@\n" if $@ || !defined $pid;
+    close $stdin_fh;
+
+    my $selector    = IO::Select->new( $stdout_fh, $stderr_fh );
+    my %stream_name = (
+        fileno($stdout_fh) => 'stdout',
+        fileno($stderr_fh) => 'stderr',
+    );
+    my %buffers = ( stdout => '', stderr => '' );
+    my %fds     = map { fileno($_) => $_ } ( $stdout_fh, $stderr_fh );
+
+    while ( $selector->count ) {
+        for my $fh ( $selector->can_read ) {
+            my $fd    = fileno($fh);
+            my $name  = $stream_name{$fd} // 'stdout';
+            my $chunk = '';
+            my $bytes = sysread( $fh, $chunk, 64 * 1024 );
+
+            if ( defined $bytes && $bytes > 0 ) {
+                $buffers{$name} .= $chunk;
+            }
+            else {
+                $selector->remove($fh);
+                close $fh;
+                delete $fds{$fd};
+            }
+        }
+    }
+
+    waitpid( $pid, 0 );
+    my $status = $?;
+    return {
+        tool      => $tool,
+        stdout    => $buffers{stdout},
+        stderr    => $buffers{stderr},
+        exit_code => $status == -1 ? -1 : ( $status >> 8 ),
+        signal    => $status & 127,
+    };
+}
+
+sub tool_result_events {
+    my ($result) = @_;
+    my @events;
+    for my $stream (qw(stdout stderr)) {
+        next unless length( $result->{$stream} // '' );
+        push @events,
+          make_event(
+            'tool_output',
+            "$result->{tool} $stream",
+            tool   => $result->{tool},
+            stream => $stream,
+            data   => $result->{$stream},
+            (
+                defined $result->{context}
+                ? ( context => $result->{context} )
+                : ()
+            ),
+          );
+    }
+    return @events;
+}
 
 sub run_ctags {
     my ( $cscope_files_path, $tags_path ) = @_;
-    system( 'ctags', '-R', '--c++-kinds=+p', '--fields=+iaSt', '-n', '-L',
-        $cscope_files_path, '-f', $tags_path, ) == 0
-      or warn "Warning: ctags exited with a non-zero status ($?).\n";
-    return;
+    return run_tool_capture( 'ctags', '-R', '--c++-kinds=+p', '--fields=+iaSt',
+        '-n', '-L', $cscope_files_path, '-f', $tags_path );
 }
 
 sub run_cscope {
     my ( $cscope_files_path, $cscope_out_path ) = @_;
-    system( 'cscope', '-b', '-c', '-q', '-i', $cscope_files_path,
-        '-f', $cscope_out_path, ) == 0
-      or warn "Warning: cscope exited with a non-zero status ($?).\n";
-    return;
+    return run_tool_capture( 'cscope', '-b', '-c', '-q', '-i',
+        $cscope_files_path, '-f', $cscope_out_path );
 }
 
 sub run_cqmakedb {
     my ( $db_path, $cscope_out_path, $tags_path ) = @_;
-    system( 'cqmakedb', '-s', $db_path, '-c', $cscope_out_path,
-        '-t', $tags_path, '-p', ) == 0
-      or die "Critical Error: Failed to run cqmakedb.\n";
-    return;
+    return run_tool_capture( 'cqmakedb', '-s', $db_path, '-c', $cscope_out_path,
+        '-t', $tags_path, '-p' );
+}
+
+sub collect {
+    my ($params) = @_;
+    $params //= {};
+
+    my $paths      = $params->{paths} // resolve_paths($params);
+    my $output_dir = $paths->{output_dir};
+
+    my $kind_filter =
+      normalize_kind_selection( $params->{kind} // join( '', @ALL_KINDS ) );
+
+    my @events;
+    my $emit = ref( $params->{emit} ) eq 'CODE' ? $params->{emit} : sub {
+        push @events, $_[0];
+    };
+
+    my @source_files = collect_source_files( $paths->{project_dir} );
+    my $total_files  = scalar @source_files;
+
+    $emit->(
+        make_event(
+            'info', "Found $total_files C/C++ source/header files.",
+            step  => 1,
+            total => 8
+        )
+    );
+
+    die "No C/C++ files found in '$paths->{project_dir}'.\n"
+      unless $total_files;
+
+    my $cscope_files_path = File::Spec->catfile( $output_dir, 'cscope.files' );
+    write_file_list( $cscope_files_path, \@source_files );
+    $emit->(
+        make_event(
+            'info', "Wrote absolute file list to 'cscope.files'.",
+            step  => 2,
+            total => 8
+        )
+    );
+
+    my $tags_path       = File::Spec->catfile( $output_dir, 'tags' );
+    my $cscope_out_path = File::Spec->catfile( $output_dir, 'cscope.out' );
+    my $db_path         = File::Spec->catfile( $output_dir, 'codequery.db' );
+    my $report_path     = File::Spec->catfile( $output_dir,
+        report_filename( $params, $kind_filter, 'txt' ) );
+    my $csv_path  = File::Spec->catfile( $output_dir, 'cpp_relationships.csv' );
+    my $json_path = File::Spec->catfile( $output_dir,
+        report_filename( $params, $kind_filter, 'json' ) );
+    my $svg_path = File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' );
+
+    my @tool_runs = (
+        [
+            3,           'Running ctags...',
+            \&run_ctags, [ $cscope_files_path, $tags_path ]
+        ],
+        [
+            4,            'Running cscope...',
+            \&run_cscope, [ $cscope_files_path, $cscope_out_path ]
+        ],
+        [
+            5,              'Generating CodeQuery database (.db)...',
+            \&run_cqmakedb, [ $db_path, $cscope_out_path, $tags_path ]
+        ],
+    );
+
+    for my $run (@tool_runs) {
+        my ( $step, $message, $runner, $args ) = @$run;
+        $emit->( make_event( 'info', $message, step => $step, total => 8 ) );
+        my $result = $runner->(@$args);
+        $emit->($_) for tool_result_events($result);
+
+        if ( $result->{exit_code} != 0 ) {
+            if ( $step == 5 ) {
+                die "Critical Error: cqmakedb exited"
+                  . " with status $result->{exit_code}.\n";
+            }
+            $emit->(
+                make_event(
+                    'warning',
+                    "$result->{tool} exited with a non-zero"
+                      . " status ($result->{exit_code}).",
+                    step  => $step,
+                    total => 8
+                )
+            );
+        }
+    }
+
+    $emit->(
+        make_event( 'info', 'Parsing tags output.', step => 6, total => 8 ) );
+    my %definitions = parse_tags($tags_path);
+
+    $emit->(
+        make_event(
+            'info',
+            'Mapping caller/callee relationships via cscope.',
+            step  => 7,
+            total => 8
+        )
+    );
+    my %callers_of = build_caller_map( \%definitions, $cscope_out_path, $emit );
+
+    my $model = {
+        project_dir    => $paths->{project_dir},
+        output_dir     => $output_dir,
+        source_files   => \@source_files,
+        definitions    => \%definitions,
+        callers_of     => \%callers_of,
+        kind_filter    => $kind_filter,
+        artifact_paths => {
+            db           => $db_path,
+            text         => $report_path,
+            csv          => $csv_path,
+            json         => $json_path,
+            svg          => $svg_path,
+            cscope_files => $cscope_files_path,
+            tags         => $tags_path,
+            cscope_out   => $cscope_out_path,
+        },
+    };
+
+    $emit->(
+        make_event(
+            'info',
+            'Writing text, CSV, JSON and SVG reports.',
+            step  => 8,
+            total => 8
+        )
+    );
+
+    return { model => $model, events => \@events };
+}
+
+sub render {
+    my ( $model, $options ) = @_;
+    die "Error: render requires a collected model.\n"
+      unless ref($model) eq 'HASH';
+    $options //= {};
+
+    my $kind_filter =
+      normalize_kind_selection( $options->{kind} // join( '', @ALL_KINDS ) );
+    my $format = {
+        hide_labels    => $options->{no_label} ? 1 : 0,
+        hide_lines     => $options->{no_line}  ? 1 : 0,
+        hide_called_by => $options->{no_call}  ? 1 : 0,
+        kind           => $kind_filter,
+    };
+
+    my $output_dir = $model->{output_dir};
+    my $paths      = {
+        db   => File::Spec->catfile( $output_dir, 'codequery.db' ),
+        text => File::Spec->catfile(
+            $output_dir, report_filename( $options, $kind_filter, 'txt' )
+        ),
+        csv  => File::Spec->catfile( $output_dir, 'cpp_relationships.csv' ),
+        json => File::Spec->catfile(
+            $output_dir, report_filename( $options, $kind_filter, 'json' )
+        ),
+        svg => File::Spec->catfile( $output_dir, 'cpp_call_graph.svg' ),
+    };
+
+    write_text_report( $paths->{text}, $model->{definitions},
+        $model->{callers_of}, $model->{project_dir}, $format );
+    write_csv_report( $paths->{csv}, $model->{callers_of},
+        $model->{project_dir} );
+    write_json_report( $paths->{json}, $model->{definitions},
+        $model->{callers_of}, $model->{project_dir}, $format );
+    write_svg_call_graph( $paths->{svg}, $model->{callers_of} );
+
+    return {
+        options        => $format,
+        artifact_paths => $paths,
+    };
+}
+
+sub report_filename {
+    my ( $opts, $kind_filter, $extension ) = @_;
+    my @suffix;
+    push @suffix, 'kind_' . join( '', @$kind_filter )
+      if @$kind_filter != @ALL_KINDS;
+    push @suffix, 'no_label' if $opts->{no_label};
+    push @suffix, 'no_line'  if $opts->{no_line};
+    push @suffix, 'no_call'  if $opts->{no_call};
+    my $name = 'cpp_relationships';
+    $name .= '__' . join( '__', @suffix ) if @suffix;
+    return "$name.$extension";
 }
 
 # ----------------------------------------------------------------------
-# ctags parsing
+# Ctags parsing
 # ----------------------------------------------------------------------
 
 # Returns %definitions{file}{symbol_name} = { kind, line, signature }
@@ -519,45 +981,53 @@ sub parse_tags {
 # For every known symbol, ask cscope "who calls this function?"
 # (cscope line-mode -L -3), and record the callers keyed by callee.
 sub build_caller_map {
-    my ( $definitions, $cscope_out_path ) = @_;
+    my ( $definitions, $cscope_out_path, $emit ) = @_;
+    $emit = sub { }
+      unless ref($emit) eq 'CODE';
 
     my %callers_of;    # callee_name => [ { caller, file, line }, ... ]
 
     for my $file ( keys %$definitions ) {
         for my $func_name ( keys %{ $definitions->{$file} } ) {
-            next
-              if $definitions->{$file}{$func_name}{kind} eq
-              'c';    # classes aren't "called"
+            next if $definitions->{$file}{$func_name}{kind} eq 'c';
 
-            my @callers = find_callers( $cscope_out_path, $func_name );
-            push @{ $callers_of{$func_name} }, @callers if @callers;
+            my ( $callers, $tool_result ) =
+              find_callers( $cscope_out_path, $func_name );
+            $emit->($_)
+              for tool_result_events(
+                {
+                    %$tool_result, context => 'caller_query',
+                }
+              );
+            push @{ $callers_of{$func_name} }, @$callers if @$callers;
         }
     }
 
     return %callers_of;
 }
 
+# cscope is also invoked while constructing the call map. It therefore uses
+# the same explicit stdout/stderr capture path as the top-level tool runs,
+# preventing any external process from writing directly to a frontend.
 sub find_callers {
     my ( $cscope_out_path, $func_name ) = @_;
 
-    open my $cscope_fh, '-|', 'cscope', '-d', '-f', $cscope_out_path, '-L',
-      '-3', $func_name
-      or return ();
+    my $result =
+      run_tool_capture( 'cscope', '-d', '-f', $cscope_out_path, '-L', '-3',
+        $func_name );
 
     my @callers;
-    while ( my $line = <$cscope_fh> ) {
-        chomp $line;
+    for my $line ( split /\n/, $result->{stdout} // '' ) {
 
         # cscope -L output format: file caller_function line_number code
         next unless $line =~ /^(\S+)\s+(\S+)\s+(\d+)\s+(.*)$/;
         my ( $file, $caller_func, $call_line, undef ) = ( $1, $2, $3, $4 );
-        next if $caller_func eq $func_name;    # skip self-recursion noise
+        next if $caller_func eq $func_name;
         push @callers,
           { caller => $caller_func, file => $file, line => $call_line };
     }
-    close $cscope_fh;
 
-    return @callers;
+    return ( \@callers, $result );
 }
 
 # ----------------------------------------------------------------------
@@ -1007,7 +1477,6 @@ sub svg_escape {
     return $text;
 }
 
-# ----------------------------------------------------------------------
 sub print_summary {
     my ( $db_path, $report_path, $csv_path, $json_path, $svg_path ) = @_;
     print <<"SUMMARY";
@@ -1032,3 +1501,10 @@ sub print_summary {
 SUMMARY
     return;
 }
+
+# ----------------------------------------------------------------------
+# MAIN - Entrypoint
+# ----------------------------------------------------------------------
+
+# Requiring this file exposes the core API without starting the CLI.
+main() unless caller;

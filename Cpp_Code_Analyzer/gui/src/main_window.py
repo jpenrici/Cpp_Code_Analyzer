@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
 
         self.config_dir_edit = QLineEdit()
         self.config_dir_edit.setPlaceholderText("Path to configuration directory")
+        self.config_dir_edit.textChanged.connect(self._maybe_autoload_config)
         config_row = self._path_row(self.config_dir_edit, self._browse_config)
         paths_form.addRow("Config dir (--config)", config_row)
 
@@ -230,6 +231,33 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(str(Path(project_path) / "output"))
         if project_path and not self.config_dir_edit.text():
             self.config_dir_edit.setText(str(Path(project_path)))
+
+    def _maybe_autoload_config(self, config_dir: str) -> None:
+        config_dir = config_dir.strip()
+        if not config_dir or not Path(config_dir).is_dir():
+            return
+        config_path = Path(config_dir) / "config.json"
+        if not config_path.is_file():
+            return
+
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.statusBar().showMessage(f"Could not read {config_path}: {exc}")
+            return
+
+        if isinstance(data.get("kind"), str):
+            selected = set(data["kind"])
+            for letter, cb in self.kind_checks.items():
+                cb.setChecked(letter in selected)
+        if "no_label" in data:
+            self.no_label_check.setChecked(bool(data["no_label"]))
+        if "no_line" in data:
+            self.no_line_check.setChecked(bool(data["no_line"]))
+        if "no_call" in data:
+            self.no_call_check.setChecked(bool(data["no_call"]))
+
+        self.statusBar().showMessage(f"Loaded options from {config_path}")
 
     # ------------------------------------------------------------------
     # Run / stop
