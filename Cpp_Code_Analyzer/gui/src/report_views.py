@@ -40,10 +40,6 @@ class TextReportView(QPlainTextEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        # QFont("A, B, C") is NOT a font-fallback list — it's a single
-        # (invalid) family name, which can make text resolve to a glyph-less
-        # fallback font on some Linux/fontconfig setups (renders blank).
-        # QFontDatabase's system fixed-pitch font is guaranteed valid.
         self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
 
     def load(self, path: Path) -> None:
@@ -88,6 +84,11 @@ class CsvReportView(QTableWidget):
                 self.setItem(r, c, QTableWidgetItem(value))
         self.resizeColumnsToContents()
 
+    def clear(self) -> None:
+        super().clear()
+        self.setRowCount(0)
+        self.setColumnCount(0)
+
 
 class JsonReportView(QTreeWidget):
     """Renders cpp_relationships.json as a collapsible tree."""
@@ -96,11 +97,7 @@ class JsonReportView(QTreeWidget):
         super().__init__(parent)
         self.setHeaderLabels(["Key", "Value"])
         self.setColumnCount(2)
-        # ResizeToContents (rather than a one-off resizeColumnToContents()
-        # call at load time) keeps sizing correct even though this tab is
-        # hidden the moment its content is populated — resizeColumnToContents
-        # on a still-hidden widget can compute a 0px column on some
-        # platforms/styles, making every row look empty until interacted with.
+
         header = self.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -171,13 +168,7 @@ class SvgGraphView(QScrollArea):
         if self._svg_widget is None:
             return
         self._svg_widget.load(str(path))
-        # sizeHint() reflects the widget's *current* layout geometry, which
-        # is unreliable while this tab is hidden (e.g. right after a run
-        # finishes, before the user clicks the tab) — it can come back as
-        # 0x0 or the QScrollArea's viewport size, making the SVG render
-        # stretched/misaligned relative to its actual background/viewBox.
-        # renderer().defaultSize() reads the size straight from the SVG
-        # document itself, so it's correct regardless of widget visibility.
+
         native_size = self._svg_widget.renderer().defaultSize()
         if (
             native_size.isValid()
@@ -185,6 +176,11 @@ class SvgGraphView(QScrollArea):
             and native_size.height() > 0
         ):
             self._svg_widget.setFixedSize(native_size)
+
+    def clear(self) -> None:
+        if self._svg_widget is not None:
+            self._svg_widget.load(b'<svg xmlns="http://www.w3.org/2000/svg"></svg>')
+            self._svg_widget.setFixedSize(0, 0)
 
 
 def build_report_tabs() -> dict[str, QWidget]:

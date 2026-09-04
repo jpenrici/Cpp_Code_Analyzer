@@ -49,7 +49,6 @@ class MainWindow(QMainWindow):
         self._collect_request_id: int | None = None
         self._collect_job_pid: str | None = None
         self._render_request_id: int | None = None
-
         self._last_project_loaded: str | None = None
 
         self._build_ui()
@@ -87,7 +86,6 @@ class MainWindow(QMainWindow):
         project_label.setToolTip("Project directory (Required)")
         self.project_edit = QLineEdit()
         self.project_edit.setPlaceholderText("Path to C/C++ project")
-        self.project_edit.textChanged.connect(self._sync_new_project)
         self.project_edit.textChanged.connect(
             lambda txt: self.project_edit.setToolTip(txt)
         )
@@ -264,8 +262,8 @@ class MainWindow(QMainWindow):
             return
 
         if path:
-            self._last_project_loaded = path
             self.project_edit.setText(path)
+            self._sync_new_project()
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
@@ -281,8 +279,8 @@ class MainWindow(QMainWindow):
             self._maybe_autoload_config(path)
 
     def _sync_new_project(self) -> None:
-        self._sync_default_output(self.project_edit.text())
-        self._sync_default_config_dir(self.project_edit.text())
+        # Stop running processes
+        self._on_stop_clicked()
 
         # Clear analysis
         self.log_view.clear()
@@ -290,7 +288,32 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.open_output_button.setEnabled(False)
         self.open_codequery_button.setEnabled(False)
-        self.statusBar().showMessage(f"Current project: {path}")
+        self._clear_report_tabs()
+
+        # Check for changes to the project
+        project_path = self.project_edit.text()
+        if project_path != self._last_project_loaded:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Confirmation")
+            msg_box.setIcon(QMessageBox.Icon.Question)
+            msg_box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            msg_box.setDefaultButton(QMessageBox.StandardButton.No)
+            msg_box.setText("Automatically fill Output directory and Config directory?")
+            reply = msg_box.exec()
+            if reply == QMessageBox.StandardButton.Yes:
+                self._sync_default_output(project_path)
+                self._sync_default_config_dir(project_path)
+
+            # Update the project to be analyzed
+            self._last_project_loaded = project_path
+
+        self.statusBar().showMessage(f"Current project: {project_path}")
+
+    def _clear_report_tabs(self) -> None:
+        for widget in self.report_widgets.values():
+            widget.clear()
 
     def _sync_default_config_dir(self, project_path: str) -> None:
         # Mirrors the script's own default (--config falls back to --in).
@@ -351,6 +374,13 @@ class MainWindow(QMainWindow):
         return self._server
 
     def _on_run_clicked(self) -> None:
+        self._sync_new_project()
+        project_path = self.project_edit.text()
+
+        if self.output_edit.text() == "":
+            QMessageBox.warning(self, "Alert", "Specify an Output directory!")
+            return
+
         options = self._collect_options()
         if options is None:
             return
@@ -390,6 +420,8 @@ class MainWindow(QMainWindow):
                 )
             except (ValueError, ProcessLookupError, PermissionError) as exc:
                 self._append_log(f"[!] Could not stop job: {exc}")
+            self._collect_job_pid = None
+
         self._reset_run_controls()
         self.statusBar().showMessage("Stopped.")
 
@@ -437,6 +469,8 @@ class MainWindow(QMainWindow):
             self._handle_render_response(message)
 
     def _handle_collect_response(self, message: dict) -> None:
+        self._collect_job_pid = None
+
         if not message.get("ok"):
             self._append_log(
                 f"[!] collect failed: {message.get('error', 'Unknown error')}"
@@ -558,6 +592,11 @@ class MainWindow(QMainWindow):
         self._maybe_autoload_config(config_dir)
 
     def _on_save_config_clicked(self) -> None:
+
+        if self.config_dir_edit.text() == "":
+            QMessageBox.warning(self, "Alert", "Specify an Config directory!")
+            return
+
         options = self._collect_options()
         if options is None:
             return
