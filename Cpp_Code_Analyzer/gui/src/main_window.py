@@ -50,6 +50,8 @@ class MainWindow(QMainWindow):
         self._collect_job_pid: str | None = None
         self._render_request_id: int | None = None
 
+        self._last_project_loaded: str | None = None
+
         self._build_ui()
         self._check_environment()
 
@@ -81,17 +83,26 @@ class MainWindow(QMainWindow):
         paths_box = QGroupBox("Project")
         paths_form = QFormLayout(paths_box)
 
+        project_label = QLabel("Project dir (--in)")
+        project_label.setToolTip("Project directory (Required)")
         self.project_edit = QLineEdit()
         self.project_edit.setPlaceholderText("Path to C/C++ project")
-        self.project_edit.textChanged.connect(self._sync_default_output)
-        self.project_edit.textChanged.connect(self._sync_default_config_dir)
+        self.project_edit.textChanged.connect(self._sync_new_project)
+        self.project_edit.textChanged.connect(
+            lambda txt: self.project_edit.setToolTip(txt)
+        )
         project_row = self._path_row(self.project_edit, self._browse_project)
-        paths_form.addRow("Project dir (--in)", project_row)
+        paths_form.addRow(project_label, project_row)
 
+        output_label = QLabel("Output dir (--out)")
+        output_label.setToolTip("Directory where the reports will be saved")
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Where reports will be written")
+        self.output_edit.setPlaceholderText("Path for reports")
+        self.output_edit.textChanged.connect(
+            lambda txt: self.output_edit.setToolTip(txt)
+        )
         output_row = self._path_row(self.output_edit, self._browse_output)
-        paths_form.addRow("Output dir (--out)", output_row)
+        paths_form.addRow(output_label, output_row)
 
         layout.addWidget(paths_box)
 
@@ -99,18 +110,29 @@ class MainWindow(QMainWindow):
         config_box = QGroupBox("Configuration (config.json)")
         config_form = QFormLayout(config_box)
 
+        config_dir_label = QLabel("Config dir (--config)")
+        config_dir_label.setToolTip(
+            "Directory where config.json will be loaded from/saved to\n"
+            "Same as the project directory by default"
+        )
         self.config_dir_edit = QLineEdit()
-        self.config_dir_edit.setPlaceholderText("Defaults to the project dir (--in)")
+        self.config_dir_edit.setPlaceholderText("Project dir (default)")
         config_dir_row = self._path_row(self.config_dir_edit, self._browse_config_dir)
         self.config_dir_edit.editingFinished.connect(
             lambda: self._maybe_autoload_config(self.config_dir_edit.text().strip())
         )
-        config_form.addRow("Config dir (--config)", config_dir_row)
+        self.config_dir_edit.textChanged.connect(
+            lambda txt: self.config_dir_edit.setToolTip(txt)
+        )
+        config_form.addRow(config_dir_label, config_dir_row)
 
         self.ignore_config_check = QCheckBox("Ignore config.json (--ignore_config)")
         self.ignore_config_check.toggled.connect(self.config_dir_edit.setDisabled)
         self.ignore_config_check.toggled.connect(
             lambda checked: config_dir_row.setDisabled(checked)
+        )
+        self.ignore_config_check.setToolTip(
+            "Skips reading config.json from the directory"
         )
         config_form.addRow("", self.ignore_config_check)
 
@@ -234,7 +256,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _browse_project(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select C/C++ project directory")
+
+        if path == self._last_project_loaded and path is not None:
+            QMessageBox.warning(
+                self, "Alert", "The chosen directory is the same!\nChange ignored!"
+            )
+            return
+
         if path:
+            self._last_project_loaded = path
             self.project_edit.setText(path)
 
     def _browse_output(self) -> None:
@@ -250,10 +280,23 @@ class MainWindow(QMainWindow):
             self.config_dir_edit.setText(path)
             self._maybe_autoload_config(path)
 
+    def _sync_new_project(self) -> None:
+        self._sync_default_output(self.project_edit.text())
+        self._sync_default_config_dir(self.project_edit.text())
+
+        # Clear analysis
+        self.log_view.clear()
+        self.run_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.open_output_button.setEnabled(False)
+        self.open_codequery_button.setEnabled(False)
+        self.statusBar().showMessage(f"Current project: {path}")
+
     def _sync_default_config_dir(self, project_path: str) -> None:
         # Mirrors the script's own default (--config falls back to --in).
-        if project_path and not self.config_dir_edit.text():
+        if project_path:
             self.config_dir_edit.setText(project_path)
+            self.ignore_config_check.setChecked(False)
             self._maybe_autoload_config(project_path)
 
     def _maybe_autoload_config(self, config_dir: str) -> None:
@@ -287,7 +330,7 @@ class MainWindow(QMainWindow):
 
     def _sync_default_output(self, project_path: str) -> None:
         # Only auto-fill; never clobber a value the user typed themselves.
-        if project_path and not self.output_edit.text():
+        if project_path:
             self.output_edit.setText(str(Path(project_path) / "output"))
 
     # ------------------------------------------------------------------
@@ -518,7 +561,12 @@ class MainWindow(QMainWindow):
         options = self._collect_options()
         if options is None:
             return
-        config_path = Path(options.project_dir) / "config.json"
+
+        config_path = Path(self.config_dir_edit.text())
+        if not config_path.is_dir:
+            config_path = Path(options.project_dir)
+        config_path /= "config.json"
+
         payload = {
             "out": options.output_dir,
             "kind": options.kinds,

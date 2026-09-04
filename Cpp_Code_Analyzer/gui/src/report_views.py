@@ -3,6 +3,7 @@ report_views.py — Small, focused widgets for browsing each artifact that
 cpp_inspector.pl produces, without pulling in QtWebEngine or any other
 heavy dependency.
 """
+
 from __future__ import annotations
 
 import csv
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 
 try:
     from PySide6.QtSvgWidgets import QSvgWidget
+
     HAS_SVG = True
 except ImportError:  # QtSvgWidgets ships separately on some distros
     HAS_SVG = False
@@ -127,7 +129,10 @@ class JsonReportView(QTreeWidget):
         item = QTreeWidgetItem(parent_item, [label])
         if isinstance(value, (dict, list)):
             count = len(value)
-            item.setText(1, f"{{{count} items}}" if isinstance(value, dict) else f"[{count} items]")
+            item.setText(
+                1,
+                f"{{{count} items}}" if isinstance(value, dict) else f"[{count} items]",
+            )
             self._populate(item, value)
         else:
             item.setText(1, self._scalar_text(value))
@@ -174,7 +179,11 @@ class SvgGraphView(QScrollArea):
         # renderer().defaultSize() reads the size straight from the SVG
         # document itself, so it's correct regardless of widget visibility.
         native_size = self._svg_widget.renderer().defaultSize()
-        if native_size.isValid() and native_size.width() > 0 and native_size.height() > 0:
+        if (
+            native_size.isValid()
+            and native_size.width() > 0
+            and native_size.height() > 0
+        ):
             self._svg_widget.setFixedSize(native_size)
 
 
