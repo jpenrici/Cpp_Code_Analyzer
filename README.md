@@ -14,28 +14,39 @@ The tool scans your project, extracts definitions (functions, prototypes, member
 
 ## Stack
 
-- **Language**: Perl 5 (85.4% of codebase)
+- **Language**: Perl
 - **Analysis Tools**: ctags, cscope, cqmakedb
 - **Output Formats**: CodeQuery database, text reports, CSV, JSON, SVG
 - **Build**: CMake for example projects
-- **License**: MIT
+- **GUI**: Optional PySide6 desktop front-end
 
 ## Directory Structure
 
 ```
 Cpp_Code_Analyzer/
+│
 ├── cpp_inspector.pl           Main Perl script (~1000 lines)
+├── setup_gui_env.pl           Provisions the GUI's Python environment
+│
+├── gui/                       Optional PySide6 desktop GUI for cpp_inspector.pl
+│   ├── app.py
+│   ├── requirements.txt
+│   └── src/
+│       ├── config.py
+│       ├── main_window.py
+│       ├── report_views.py
+│       └── runner.py
+│
 ├── Example_Project_01/        Sample C++ project (CMake-based)
 │   ├── CMakeLists.txt
-│   ├── include/
-│   ├── src/
-│   │   ├── main.cpp
-│   │   └── hello.cpp
-│   └── include/hello.hpp
+│   ├── include/*.hpp
+│   └── src/
+│       ├── main.cpp
+│       └── hello.cpp
 │
 └── Example_Project_02/        Second example project
     ├── CMakeLists.txt
-    ├── include/
+    ├── include/*.hpp
     └── src/
         ├── main.cpp
         ├── calculator.cpp
@@ -69,6 +80,26 @@ brew install universal-ctags cscope codequery
 perl cpp_inspector.pl --in=/path/to/project --out=/path/to/output
 ```
 
+## GUI
+
+A desktop GUI is available in `gui/`.
+
+The GUI never reimplements any analysis logic. It talks to`cpp_inspector.pl` over its `--serve` mode — a JSON-lines protocol where one long-lived `perl cpp_inspector.pl --serve` process is started and reused for every run, instead of re-spawning the script and scraping its text output each time. Progress, tool output, and the exact paths of the generated reports all arrive as structured JSON, so the GUI and the CLI can never drift out of sync on things like output filenames.
+
+### GUI Setup
+
+```bash
+perl setup_gui_env.pl
+```
+
+This creates a virtualenv at `gui/.venv`, installs `gui/requirements.txt` (PySide6) into it, and writes `run_gui.sh` / `run_gui.bat` launchers at the repo root. Then just run:
+
+```bash
+./run_gui.sh          # or run_gui.bat on Windows
+```
+
+`setup_gui_env.pl` supports the same conventions as `cpp_inspector.pl` itself — `--yes`/`-y` to skip prompts, `--force` to recreate an existing virtualenv, `--python=<bin>` to pick a specific interpreter, and `--help`/`-h` for details. It also checks that `ctags`/`cscope`/`cqmakedb` are on `PATH`, since the GUI still needs them to actually run analyses.
+
 ## Usage
 
 ### Basic Analysis
@@ -91,16 +122,19 @@ perl cpp_inspector.pl --in=./my_project --out=./results --kind=fp --no_line --ye
 |------|-------------|
 | `--in=<path>` | Project directory to analyze (required) |
 | `--out=<path>` | Output directory (default: `output`) |
+| `--config=<path>` | Configuration directory (default: `project dir`) |
 | `--kind=<letters>` | Filter symbol types: `f` (functions), `p` (prototypes), `m` (members), `c` (classes) |
 | `--no_label` | Omit symbol kind labels in reports |
 | `--no_line` | Omit line numbers in reports |
 | `--no_call` | Omit "Called by" sections in reports |
+| `-ignore_config` | Ignore config.json even if it is present |
 | `--yes, -y` | Skip confirmation prompts (useful for CI/automation) |
+| `--serve` | Run the dependency-free JSON-lines API server |
 | `--help, -h` | Display help message |
 
 ### Project Configuration
 
-Create a `config.json` file in your project root to set default options:
+Create a `config.json` file in configuration directory to set default options:
 
 ```json
 {
@@ -263,14 +297,6 @@ Example JSON structure:
 - Dynamic report generation based on active options
 - Deduplication: Avoids duplicate caller entries and relationships
 
-### Module Dependencies
-
-- `strict`, `warnings`, `feature`: Modern Perl practices
-- `Cwd`: Path resolution
-- `File::Basename`, `File::Find`, `File::Path`, `File::Spec`: File operations
-- `Getopt::Long`: Command-line parsing
-- `JSON::PP`: JSON encoding/decoding
-
 ## Example
 
 ```bash
@@ -279,17 +305,28 @@ perl cpp_inspector.pl --in=./Example_Project_01 --out=./analysis
 
 **Output:**
 ```
+[?] Output directory does not exist: /full/path/to/analysis
+    Create it now? [y/N] y
 [*] Scanning project directory: /full/path/to/Example_Project_01
 [*] Saving output artifacts to: /full/path/to/analysis
+[*] Current Config directory: /full/path/to/Example_Project_01
+[*] Current commands:  --kinds=fpmc
 
 [1/8] Found 3 C/C++ source/header files.
 [2/8] Wrote absolute file list to 'cscope.files'.
 [3/8] Running ctags...
 [4/8] Running cscope...
 [5/8] Generating CodeQuery database (.db)...
-[6/8] Parsing tags output...
-[7/8] Mapping caller/callee relationships via cscope...
-[8/8] Writing text, CSV, JSON and SVG reports...
+cscope.out sanity check OK
+cscope.out detailed check OK
+Adding symbols ...
+Finalizing ...
+Processing ctags file ...
+Finalizing ...
+Compacting database ...
+[6/8] Parsing tags output.
+[7/8] Mapping caller/callee relationships via cscope.
+[8/8] Writing text, CSV, JSON and SVG reports.
 
 [SUCCESS] Pipeline completed successfully!
 --------------------------------------------------
@@ -310,33 +347,10 @@ perl cpp_inspector.pl --in=./Example_Project_01 --out=./analysis
 --------------------------------------------------
 ```
 
-## Features
-
-- **Symbol Extraction**: Functions, prototypes, class members, and class definitions
-- **Call Graph Analysis**: Maps caller-callee relationships automatically
-- **Flexible Filtering**: Include/exclude symbol types by kind
-- **Multiple Output Formats**: Text, CSV, JSON, SVG, and CodeQuery database
-- **Report Customization**: Control label visibility, line numbers, and relationship depth
-- **Project Configuration**: Use config.json for persistent default settings
-- **CI/Automation Ready**: Non-interactive mode for integration into pipelines
-- **Security**: Refuses to run as root
-- **Path Handling**: Shortens paths in reports for readability
-- **Deduplication**: Eliminates redundant caller/callee pairs in outputs
-- **Self-Recursion Filtering**: Ignores self-referential calls in analysis
-
-## Performance Notes
-
-- Processing time scales with project size (files and symbols)
-- Typical small project (< 100 files): < 5 seconds
-- Large projects (1000+ files): 30-120 seconds depending on system
-- Memory efficient: Streams file processing, uses hashes for symbol indexing
-- Output file sizes:
-  - `.db`: Varies by symbol count and complexity
-  - `.txt`: ~50-500 lines per 100 functions
-  - `.csv`: ~1 row per call relationship
-  - `.json`: Approximately 2-3x size of text report
-  - `.svg`: Compact unless there are 1000+ unique functions
-
 ## License
 
 MIT License - see LICENSE file for details
+
+## Display
+
+![GUI Screenshot](https://github.com/jpenrici/Cpp_Code_Analyzer/blob/main/display/display.png)
